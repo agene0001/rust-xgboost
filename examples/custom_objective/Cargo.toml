@@ -5,5 +5,5 @@ authors = ["Dave Challis <dave@suicas.net>"]
 publish = false
 
 [dependencies]
-xgboost = { path = "../../" }
+xgb = { path = "../../" }
 ndarray = "0.11"

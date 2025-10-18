@@ -104,10 +104,6 @@ or new features are supported. This is still expected to be compatible to an ear
 
 Builds against XGBoost 3.0.0.
 
-Deactivated test:
-
-- booster::dump_model, reason: Output seems to be empty.
-
 ## Use prebuilt xgboost library or build it
 
 Xgboost is kind of complicated to compile, especially when there is GPU support involved.
