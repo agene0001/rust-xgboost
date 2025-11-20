@@ -197,8 +197,15 @@ impl Booster {
             dmats
         };
 
-        let bst = Booster::new_with_cached_dmats(&params.booster_params, &cached_dmats)?;
+        let mut bst = Booster::new_with_cached_dmats(&params.booster_params, &cached_dmats)?;
         for i in 0..params.boost_rounds as i32 {
+            debug!("Updating in round: {}", i);
+            if let Some(objective_fn) = params.custom_objective_fn {
+                bst.update_custom(params.dtrain, objective_fn)?;
+            } else {
+                bst.update(params.dtrain, i)?;
+            }
+
             if let Some(eval_sets) = params.evaluation_sets {
                 let mut dmat_eval_results = bst.eval_set(eval_sets, i)?;
 
@@ -1235,7 +1242,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn dump_model() {
         let dmat_train =
             DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.train?format=libsvm"}"#).unwrap();
