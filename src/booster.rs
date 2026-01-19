@@ -517,6 +517,7 @@ impl Booster {
     ///
     /// If the booster has feature names set, this checks that the number of features matches
     /// the number of columns in the DMatrix. If no feature names are set, this is a no-op.
+    /// If the DMatrix has 0 columns (unknown dimensions from CSR/CSC sparse matrices), validation is skipped.
     fn validate_features(&self, dmat: &DMatrix) -> XGBResult<()> {
         let feature_names = self.get_feature_names()?;
         if feature_names.is_empty() {
@@ -524,9 +525,13 @@ impl Booster {
             return Ok(());
         }
 
-        let num_features = feature_names.len();
         let num_cols = dmat.num_cols();
+        if num_cols == 0 {
+            // Column count unknown (e.g., inferred from CSR/CSC), skip validation
+            return Ok(());
+        }
 
+        let num_features = feature_names.len();
         if num_features != num_cols {
             return Err(XGBError::new(format!(
                 "Feature names mismatch: booster has {} features but DMatrix has {} columns",

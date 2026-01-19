@@ -258,7 +258,9 @@ impl DMatrix {
         // Use XGDMatrixCreateFromURI with a JSON config specifying the URI
         // Binary format is auto-detected, no format parameter needed
         let path_str = path.as_ref().to_string_lossy();
-        let config = format!(r#"{{"uri": "{}", "silent": 1}}"#, path_str);
+        // Escape backslashes and quotes for valid JSON
+        let escaped_path = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+        let config = format!(r#"{{"uri": "{}", "silent": 1}}"#, escaped_path);
         let config_cstr = ffi::CString::new(config).unwrap();
         xgb_call!(xgboost_sys::XGDMatrixCreateFromURI(config_cstr.as_ptr(), &mut handle))?;
         DMatrix::new(handle)
