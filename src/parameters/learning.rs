@@ -123,10 +123,14 @@ pub enum EvaluationMetric {
     /// Negative log-likelihood.
     LogLoss,
 
-    // TODO: use error as field if set to 0.5
-    /// Binary classification error rate. It is calculated as #(wrong cases)/#(all cases).
+    /// Binary classification error rate with default threshold of 0.5.
+    /// It is calculated as #(wrong cases)/#(all cases).
+    BinaryError,
+
+    /// Binary classification error rate with custom threshold.
+    /// It is calculated as #(wrong cases)/#(all cases).
     /// For the predictions, the evaluation will regard the instances with prediction value larger than
-    /// given threshold as positive instances, and the others as negative instances.
+    /// the given threshold as positive instances, and the others as negative instances.
     BinaryErrorRate(f32),
 
     /// Multiclass classification error rate. It is calculated as #(wrong cases)/#(all cases).
@@ -186,13 +190,8 @@ impl std::fmt::Display for EvaluationMetric {
             EvaluationMetric::RMSE => "rmse".to_owned(),
             EvaluationMetric::MAE => "mae".to_owned(),
             EvaluationMetric::LogLoss => "logloss".to_owned(),
-            EvaluationMetric::BinaryErrorRate(t) => {
-                if (t - 0.5).abs() < f32::EPSILON {
-                    "error".to_owned()
-                } else {
-                    format!("error@{}", t)
-                }
-            }
+            EvaluationMetric::BinaryError => "error".to_owned(),
+            EvaluationMetric::BinaryErrorRate(t) => format!("error@{}", t),
             EvaluationMetric::MultiClassErrorRate => "merror".to_owned(),
             EvaluationMetric::MultiClassLogLoss => "mlogloss".to_owned(),
             EvaluationMetric::AUC => "auc".to_owned(),

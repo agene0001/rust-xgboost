@@ -9,6 +9,42 @@ static KEY_LABEL: &str = "label";
 static KEY_WEIGHT: &str = "weight";
 static KEY_BASE_MARGIN: &str = "base_margin";
 
+/// Creates a JSON-encoded array interface string for f32 data.
+fn make_array_interface_f32(data: &[f32]) -> String {
+    let ptr = data.as_ptr() as usize;
+    let len = data.len();
+    format!(
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<f4","version":3}}"#,
+        ptr, len
+    )
+}
+
+/// Creates a JSON-encoded array interface string for usize data.
+fn make_array_interface_usize(data: &[usize]) -> String {
+    let ptr = data.as_ptr() as usize;
+    let len = data.len();
+    // usize is platform-dependent, typically 8 bytes on 64-bit systems
+    let typestr = if std::mem::size_of::<usize>() == 8 {
+        "<u8" // little-endian unsigned 8-byte integer
+    } else {
+        "<u4" // little-endian unsigned 4-byte integer
+    };
+    format!(
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"{}","version":3}}"#,
+        ptr, len, typestr
+    )
+}
+
+/// Creates a JSON-encoded array interface string for u32 data.
+fn make_array_interface_u32(data: &[u32]) -> String {
+    let ptr = data.as_ptr() as usize;
+    let len = data.len();
+    format!(
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<u4","version":3}}"#,
+        ptr, len
+    )
+}
+
 /// Data matrix used throughout XGBoost for training/predicting [`Booster`](struct.Booster.html) models.
 ///
 /// It's used as a container for both features (i.e. a row for every instance), and an optional true label for that
@@ -131,15 +167,23 @@ impl DMatrix {
     pub fn from_csr(indptr: &[usize], indices: &[usize], data: &[f32], num_cols: Option<usize>) -> XGBResult<Self> {
         assert_eq!(indices.len(), data.len());
         let mut handle = ptr::null_mut();
-        let indices: Vec<u32> = indices.iter().map(|x| *x as u32).collect();
-        let num_cols = num_cols.unwrap_or(0); // infer from data if 0
-        xgb_call!(xgboost_sys::XGDMatrixCreateFromCSREx(
-            indptr.as_ptr(),
-            indices.as_ptr(),
-            data.as_ptr(),
-            indptr.len(),
-            data.len(),
+        let num_cols = num_cols.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
+
+        let indptr_interface = make_array_interface_usize(indptr);
+        let indices_interface = make_array_interface_usize(indices);
+        let data_interface = make_array_interface_f32(data);
+
+        let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
+        let indices_cstr = ffi::CString::new(indices_interface).unwrap();
+        let data_cstr = ffi::CString::new(data_interface).unwrap();
+        let config = ffi::CString::new(r#"{"missing": NaN}"#).unwrap();
+
+        xgb_call!(xgboost_sys::XGDMatrixCreateFromCSR(
+            indptr_cstr.as_ptr(),
+            indices_cstr.as_ptr(),
+            data_cstr.as_ptr(),
             num_cols,
+            config.as_ptr(),
             &mut handle
         ))?;
         DMatrix::new(handle)
@@ -156,15 +200,23 @@ impl DMatrix {
     pub fn from_csc(indptr: &[usize], indices: &[usize], data: &[f32], num_rows: Option<usize>) -> XGBResult<Self> {
         assert_eq!(indices.len(), data.len());
         let mut handle = ptr::null_mut();
-        let indices: Vec<u32> = indices.iter().map(|x| *x as u32).collect();
-        let num_rows = num_rows.unwrap_or(0); // infer from data if 0
-        xgb_call!(xgboost_sys::XGDMatrixCreateFromCSCEx(
-            indptr.as_ptr(),
-            indices.as_ptr(),
-            data.as_ptr(),
-            indptr.len(),
-            data.len(),
+        let num_rows = num_rows.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
+
+        let indptr_interface = make_array_interface_usize(indptr);
+        let indices_interface = make_array_interface_usize(indices);
+        let data_interface = make_array_interface_f32(data);
+
+        let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
+        let indices_cstr = ffi::CString::new(indices_interface).unwrap();
+        let data_cstr = ffi::CString::new(data_interface).unwrap();
+        let config = ffi::CString::new(r#"{"missing": NaN}"#).unwrap();
+
+        xgb_call!(xgboost_sys::XGDMatrixCreateFromCSC(
+            indptr_cstr.as_ptr(),
+            indices_cstr.as_ptr(),
+            data_cstr.as_ptr(),
             num_rows,
+            config.as_ptr(),
             &mut handle
         ))?;
         DMatrix::new(handle)
@@ -203,8 +255,12 @@ impl DMatrix {
     pub fn load_binary<P: AsRef<Path>>(path: P) -> XGBResult<Self> {
         debug!("Loading DMatrix from: {}", path.as_ref().display());
         let mut handle = ptr::null_mut();
-        let fname = crate::path_to_c_str(path);
-        xgb_call!(xgboost_sys::XGDMatrixCreateFromFile(fname.as_ptr(), 1, &mut handle)).unwrap();
+        // Use XGDMatrixCreateFromURI with a JSON config specifying the URI
+        // Binary format is auto-detected, no format parameter needed
+        let path_str = path.as_ref().to_string_lossy();
+        let config = format!(r#"{{"uri": "{}", "silent": 1}}"#, path_str);
+        let config_cstr = ffi::CString::new(config).unwrap();
+        xgb_call!(xgboost_sys::XGDMatrixCreateFromURI(config_cstr.as_ptr(), &mut handle))?;
         DMatrix::new(handle)
     }
 
@@ -348,11 +404,12 @@ impl DMatrix {
 
     fn set_uint_info(&mut self, field: &str, array: &[u32]) -> XGBResult<()> {
         let field = ffi::CString::new(field).unwrap();
-        xgb_call!(xgboost_sys::XGDMatrixSetUIntInfo(
+        let array_interface = make_array_interface_u32(array);
+        let data_cstr = ffi::CString::new(array_interface).unwrap();
+        xgb_call!(xgboost_sys::XGDMatrixSetInfoFromInterface(
             self.handle,
             field.as_ptr(),
-            array.as_ptr(),
-            array.len() as u64
+            data_cstr.as_ptr()
         ))
     }
 }
@@ -397,7 +454,12 @@ mod tests {
 
         assert_eq!(dmat.num_rows(), dmat2.num_rows());
         assert_eq!(dmat.num_cols(), dmat2.num_cols());
-        // TODO: check contents as well, if possible
+
+        // Verify labels are preserved after save/load
+        let labels1 = dmat.get_labels().unwrap();
+        let labels2 = dmat2.get_labels().unwrap();
+        assert_eq!(labels1.len(), labels2.len());
+        assert_eq!(labels1, labels2);
     }
 
     #[test]

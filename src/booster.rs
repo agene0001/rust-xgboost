@@ -10,9 +10,22 @@ use std::{ffi, fmt, fs::File, ptr, slice};
 use indexmap::IndexMap;
 
 use super::XGBResult;
-use crate::parameters::{BoosterParameters, TrainingParameters};
+use crate::parameters::{BoosterParameters, CallbackEnv, TrainingParameters};
 
 pub type CustomObjective = fn(&[f32], &DMatrix) -> (Vec<f32>, Vec<f32>);
+
+/// Creates a JSON-encoded array interface string for use with XGBoost C API.
+/// This follows the NumPy array interface specification.
+fn make_array_interface(data: &[f32]) -> String {
+    let ptr = data.as_ptr() as usize;
+    let len = data.len();
+    // Format: {"data": [ptr, read_only], "shape": [len], "typestr": "<f4", "version": 3}
+    // "<f4" means little-endian 4-byte float (f32)
+    format!(
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<f4","version":3}}"#,
+        ptr, len
+    )
+}
 
 /// Used to control the return type of predictions made by C Booster API.
 enum PredictOption {
@@ -104,9 +117,16 @@ impl Booster {
     /// Create a new Booster model with given parameters and list of DMatrix to cache.
     ///
     /// Cached DMatrix can sometimes be used internally by XGBoost to speed up certain operations.
+    ///
+    /// # Safety Note
+    ///
+    /// The DMatrix handles are only used during the `XGBoosterCreate` call to initialize
+    /// internal caches. The booster does not retain references to the DMatrix objects after
+    /// creation, so it is safe if the DMatrix objects are freed after this function returns.
+    /// However, for training purposes, you should keep the DMatrix alive for the duration
+    /// of training since you'll need to pass it to `update()` or `update_custom()`.
     pub fn new_with_cached_dmats(params: &BoosterParameters, dmats: &[&DMatrix]) -> XGBResult<Self> {
         let mut handle = ptr::null_mut();
-        // TODO: check this is safe if any dmats are freed
         let s: Vec<xgboost_sys::DMatrixHandle> = dmats.iter().map(|x| x.handle).collect();
         xgb_call!(xgboost_sys::XGBoosterCreate(
             s.as_ptr(),
@@ -201,12 +221,13 @@ impl Booster {
         for i in 0..params.boost_rounds as i32 {
             debug!("Updating in round: {}", i);
             if let Some(objective_fn) = params.custom_objective_fn {
-                bst.update_custom(params.dtrain, objective_fn)?;
+                bst.update_custom(params.dtrain, i, objective_fn)?;
             } else {
                 bst.update(params.dtrain, i)?;
             }
 
-            if let Some(eval_sets) = params.evaluation_sets {
+            // Collect evaluation results if evaluation sets are provided
+            let evaluation_results = if let Some(eval_sets) = params.evaluation_sets {
                 let mut dmat_eval_results = bst.eval_set(eval_sets, i)?;
 
                 if let Some(eval_fn) = params.custom_evaluation_fn {
@@ -237,6 +258,27 @@ impl Booster {
                     }
                 }
                 println!();
+
+                Some(dmat_eval_results)
+            } else {
+                None
+            };
+
+            // Invoke callbacks if any are registered
+            if let Some(ref callbacks) = params.callbacks {
+                let callback_env = CallbackEnv {
+                    iteration: i,
+                    total_rounds: params.boost_rounds,
+                    evaluation_results,
+                };
+
+                for callback in callbacks {
+                    if !callback(&callback_env) {
+                        // Callback returned false, stop training early
+                        debug!("Callback requested early stopping at iteration {}", i);
+                        return Ok(bst);
+                    }
+                }
             }
         }
 
@@ -267,10 +309,14 @@ impl Booster {
     }
 
     /// Update this model by training it for one round with a custom objective function.
-    pub fn update_custom(&mut self, dtrain: &DMatrix, objective_fn: CustomObjective) -> XGBResult<()> {
+    ///
+    /// * `dtrain` - matrix to train the model with for a single iteration
+    /// * `iteration` - current iteration number
+    /// * `objective_fn` - custom objective function that returns (gradient, hessian)
+    pub fn update_custom(&mut self, dtrain: &DMatrix, iteration: i32, objective_fn: CustomObjective) -> XGBResult<()> {
         let pred = self.predict(dtrain)?;
         let (gradient, hessian) = objective_fn(&pred.to_vec(), dtrain);
-        self.boost(dtrain, &gradient, &hessian)
+        self.boost(dtrain, iteration, &gradient, &hessian)
     }
 
     /// Update this model by directly specifying the first and second order gradients.
@@ -278,9 +324,10 @@ impl Booster {
     /// This is typically used instead of `update` when using a customised loss function.
     ///
     /// * `dtrain` - matrix to train the model with for a single iteration
+    /// * `iteration` - current iteration number
     /// * `gradient` - first order gradient
     /// * `hessian` - second order gradient
-    fn boost(&mut self, dtrain: &DMatrix, gradient: &[f32], hessian: &[f32]) -> XGBResult<()> {
+    fn boost(&mut self, dtrain: &DMatrix, iteration: i32, gradient: &[f32], hessian: &[f32]) -> XGBResult<()> {
         if gradient.len() != hessian.len() {
             let msg = format!(
                 "Mismatch between length of gradient and hessian arrays ({} != {})",
@@ -291,15 +338,20 @@ impl Booster {
         }
         assert_eq!(gradient.len(), hessian.len());
 
-        // TODO: _validate_feature_names
-        let mut grad_vec = gradient.to_vec();
-        let mut hess_vec = hessian.to_vec();
-        xgb_call!(xgboost_sys::XGBoosterBoostOneIter(
+        self.validate_features(dtrain)?;
+
+        let grad_interface = make_array_interface(gradient);
+        let hess_interface = make_array_interface(hessian);
+
+        let grad_cstr = ffi::CString::new(grad_interface).unwrap();
+        let hess_cstr = ffi::CString::new(hess_interface).unwrap();
+
+        xgb_call!(xgboost_sys::XGBoosterTrainOneIter(
             self.handle,
             dtrain.handle,
-            grad_vec.as_mut_ptr(),
-            hess_vec.as_mut_ptr(),
-            grad_vec.len() as u64
+            iteration,
+            grad_cstr.as_ptr(),
+            hess_cstr.as_ptr()
         ))
     }
 
@@ -459,6 +511,30 @@ impl Booster {
             c_feature_ptr.as_mut_ptr() as *mut *const raw::c_char,
             features.len() as u64
         ))
+    }
+
+    /// Validate that the feature names in this booster are compatible with the given DMatrix.
+    ///
+    /// If the booster has feature names set, this checks that the number of features matches
+    /// the number of columns in the DMatrix. If no feature names are set, this is a no-op.
+    fn validate_features(&self, dmat: &DMatrix) -> XGBResult<()> {
+        let feature_names = self.get_feature_names()?;
+        if feature_names.is_empty() {
+            // No feature names set, nothing to validate
+            return Ok(());
+        }
+
+        let num_features = feature_names.len();
+        let num_cols = dmat.num_cols();
+
+        if num_features != num_cols {
+            return Err(XGBError::new(format!(
+                "Feature names mismatch: booster has {} features but DMatrix has {} columns",
+                num_features, num_cols
+            )));
+        }
+
+        Ok(())
     }
 
     /// Predict results for given data.
@@ -954,7 +1030,7 @@ mod tests {
             .eval_metrics(learning::Metrics::Custom(vec![
                 learning::EvaluationMetric::MAPCutNegative(4),
                 learning::EvaluationMetric::LogLoss,
-                learning::EvaluationMetric::BinaryErrorRate(0.5),
+                learning::EvaluationMetric::BinaryError,
             ]))
             .build()
             .unwrap();
@@ -1039,7 +1115,7 @@ mod tests {
             .eval_metrics(learning::Metrics::Custom(vec![
                 learning::EvaluationMetric::MAPCutNegative(4),
                 learning::EvaluationMetric::LogLoss,
-                learning::EvaluationMetric::BinaryErrorRate(0.5),
+                learning::EvaluationMetric::BinaryError,
             ]))
             .build()
             .unwrap();

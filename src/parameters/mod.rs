@@ -15,8 +15,8 @@ pub mod linear;
 pub mod tree;
 
 pub use self::booster::BoosterType;
-use super::booster::CustomObjective;
 use super::DMatrix;
+use super::booster::CustomObjective;
 
 /// Parameters for training boosters.
 /// Created using [`BoosterParametersBuilder`](struct.BoosterParametersBuilder.html).
@@ -105,6 +105,23 @@ impl BoosterParameters {
 
 type CustomEvaluation = fn(&[f32], &DMatrix) -> f32;
 
+/// Information passed to callbacks after each training round.
+#[derive(Debug, Clone)]
+pub struct CallbackEnv {
+    /// Current iteration number (0-indexed).
+    pub iteration: i32,
+    /// Total number of boosting rounds.
+    pub total_rounds: u32,
+    /// Evaluation results for this round, if evaluation sets were provided.
+    /// Maps dataset name -> (metric name -> score).
+    pub evaluation_results: Option<indexmap::IndexMap<String, indexmap::IndexMap<String, f32>>>,
+}
+
+/// Callback function type for training events.
+///
+/// Returns `true` to continue training, `false` to stop early.
+pub type TrainingCallback = fn(&CallbackEnv) -> bool;
+
 /// Parameters used by the [`Booster::train`](../struct.Booster.html#method.train) method for training new models.
 /// Created using [`TrainingParametersBuilder`](struct.TrainingParametersBuilder.html).
 #[derive(Builder, Clone)]
@@ -144,7 +161,15 @@ pub struct TrainingParameters<'a> {
     /// *default*: `None`
     #[builder(default = "None")]
     pub(crate) custom_evaluation_fn: Option<CustomEvaluation>,
-    // TODO: callbacks
+
+    /// Optional list of callback functions to call after each training round.
+    ///
+    /// Each callback receives a `CallbackEnv` with information about the current training state.
+    /// If any callback returns `false`, training will stop early.
+    ///
+    /// *default*: `None`
+    #[builder(default = "None")]
+    pub(crate) callbacks: Option<Vec<TrainingCallback>>,
 }
 
 impl<'a> TrainingParameters<'a> {
@@ -194,6 +219,14 @@ impl<'a> TrainingParameters<'a> {
 
     pub fn set_custom_evaluation_fn(&mut self, custom_evaluation_fn: Option<CustomEvaluation>) {
         self.custom_evaluation_fn = custom_evaluation_fn;
+    }
+
+    pub fn callbacks(&self) -> Option<&Vec<TrainingCallback>> {
+        self.callbacks.as_ref()
+    }
+
+    pub fn set_callbacks(&mut self, callbacks: Option<Vec<TrainingCallback>>) {
+        self.callbacks = callbacks;
     }
 }
 
