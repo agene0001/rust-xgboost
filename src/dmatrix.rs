@@ -19,19 +19,17 @@ fn make_array_interface_f32(data: &[f32]) -> String {
     )
 }
 
-/// Creates a JSON-encoded array interface string for usize data.
-fn make_array_interface_usize(data: &[usize]) -> String {
+/// Creates a JSON-encoded array interface string for u64 data.
+///
+/// This function is used for CSR/CSC indices and indptr arrays.
+/// XGBoost's C API expects uint64_t (bst_ulong) for these arrays,
+/// so we use fixed-width u64 to ensure cross-platform compatibility.
+fn make_array_interface_u64(data: &[u64]) -> String {
     let ptr = data.as_ptr() as usize;
     let len = data.len();
-    // usize is platform-dependent, typically 8 bytes on 64-bit systems
-    let typestr = if std::mem::size_of::<usize>() == 8 {
-        "<u8" // little-endian unsigned 8-byte integer
-    } else {
-        "<u4" // little-endian unsigned 4-byte integer
-    };
     format!(
-        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"{}","version":3}}"#,
-        ptr, len, typestr
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<u8","version":3}}"#,
+        ptr, len
     )
 }
 
@@ -169,8 +167,12 @@ impl DMatrix {
         let mut handle = ptr::null_mut();
         let num_cols = num_cols.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
 
-        let indptr_interface = make_array_interface_usize(indptr);
-        let indices_interface = make_array_interface_usize(indices);
+        // Convert usize to u64 for cross-platform compatibility with XGBoost's C API
+        let indptr_u64: Vec<u64> = indptr.iter().map(|&x| x as u64).collect();
+        let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
+
+        let indptr_interface = make_array_interface_u64(&indptr_u64);
+        let indices_interface = make_array_interface_u64(&indices_u64);
         let data_interface = make_array_interface_f32(data);
 
         let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
@@ -202,8 +204,12 @@ impl DMatrix {
         let mut handle = ptr::null_mut();
         let num_rows = num_rows.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
 
-        let indptr_interface = make_array_interface_usize(indptr);
-        let indices_interface = make_array_interface_usize(indices);
+        // Convert usize to u64 for cross-platform compatibility with XGBoost's C API
+        let indptr_u64: Vec<u64> = indptr.iter().map(|&x| x as u64).collect();
+        let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
+
+        let indptr_interface = make_array_interface_u64(&indptr_u64);
+        let indices_interface = make_array_interface_u64(&indices_u64);
         let data_interface = make_array_interface_f32(data);
 
         let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
@@ -252,12 +258,20 @@ impl DMatrix {
         DMatrix::new(handle)
     }
 
+    /// Load a `DMatrix` from a binary file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path contains non-UTF8 characters.
     pub fn load_binary<P: AsRef<Path>>(path: P) -> XGBResult<Self> {
         debug!("Loading DMatrix from: {}", path.as_ref().display());
         let mut handle = ptr::null_mut();
         // Use XGDMatrixCreateFromURI with a JSON config specifying the URI
         // Binary format is auto-detected, no format parameter needed
-        let path_str = path.as_ref().to_string_lossy();
+        let path_str = path
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| XGBError::new("Path contains non-UTF8 characters"))?;
         // Escape backslashes and quotes for valid JSON
         let escaped_path = path_str.replace('\\', "\\\\").replace('"', "\\\"");
         let config = format!(r#"{{"uri": "{}", "silent": 1}}"#, escaped_path);
