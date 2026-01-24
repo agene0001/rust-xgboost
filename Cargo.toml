@@ -1,6 +1,6 @@
 [package]
 name = "xgb"
-version = "3.0.5"
+version = "3.1.3"
 authors = ["Dave Challis <dave@suicas.net>", "Marco Mengelkoch"]
 license = "MIT"
 repository = "https://github.com/marcomq/rust-xgboost"
@@ -11,8 +11,8 @@ readme = "README.md"
 edition = "2024"
 
 [dependencies]
-xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.0.4" }
-libc = "1.0.0-alpha.2"
+xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.1.3" }
+libc = "0.2.180"
 derive_builder = "0.20.2"
 log = "0.4.29"
 tempfile = "3.24.0"
@@ -23,3 +23,13 @@ use_prebuilt_xgb = ["xgboost-sys/use_prebuilt_xgb"]
 local_build = ["xgboost-sys/local_build"]
 cuda = ["xgboost-sys/cuda"]
 default  = ["use_prebuilt_xgb"]
+
+[dev-dependencies]
+criterion = "0.8.1"
+
+[[bench]]
+name = "dmatrix_benchmark"
+harness = false
+
+[[example]]
+name = "bench_table"

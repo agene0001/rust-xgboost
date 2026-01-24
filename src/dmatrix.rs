@@ -92,8 +92,8 @@ fn make_array_interface_u32(data: &[u32]) -> String {
 /// ```
 /// use xgb::DMatrix;
 ///
-/// let indptr = &[0, 1, 2, 6];
-/// let indices = &[0, 2, 2, 0, 1, 2];
+/// let indptr: &[u64] = &[0, 1, 2, 6];
+/// let indices: &[u64] = &[0, 2, 2, 0, 1, 2];
 /// let data = &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
 /// let dmat = DMatrix::from_csc(indptr, indices, data, None).unwrap();
 /// assert_eq!(dmat.shape(), (3, 3));
@@ -162,23 +162,33 @@ impl DMatrix {
     /// `data[indptr[i]:indptr[i+1]`.
     ///
     /// If `num_cols` is set to None, number of columns will be inferred from given data.
-    pub fn from_csr(indptr: &[usize], indices: &[usize], data: &[f32], num_cols: Option<usize>) -> XGBResult<Self> {
+    ///
+    /// Note: For small matrices (< 30000 non-zero elements), single-threaded creation is used
+    /// to avoid thread synchronization overhead. For larger matrices, multi-threaded creation
+    /// is used for better performance.
+    pub fn from_csr(indptr: &[u64], indices: &[u64], data: &[f32], num_cols: Option<usize>) -> XGBResult<Self> {
+        // Threshold below which single-threaded is faster due to thread overhead.
+        // Benchmarking shows crossover point is around 30k non-zeros on typical hardware.
+        const SINGLE_THREAD_THRESHOLD: usize = 30000;
+
         assert_eq!(indices.len(), data.len());
         let mut handle = ptr::null_mut();
-        let num_cols = num_cols.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
+        let num_cols = num_cols.unwrap_or(0) as xgboost_sys::bst_ulong;
 
-        // Convert usize to u64 for cross-platform compatibility with XGBoost's C API
-        let indptr_u64: Vec<u64> = indptr.iter().map(|&x| x as u64).collect();
-        let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
-
-        let indptr_interface = make_array_interface_u64(&indptr_u64);
-        let indices_interface = make_array_interface_u64(&indices_u64);
+        let indptr_interface = make_array_interface_u64(indptr);
+        let indices_interface = make_array_interface_u64(indices);
         let data_interface = make_array_interface_f32(data);
 
         let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
         let indices_cstr = ffi::CString::new(indices_interface).unwrap();
         let data_cstr = ffi::CString::new(data_interface).unwrap();
-        let config = ffi::CString::new(r#"{"missing": NaN}"#).unwrap();
+
+        // Use single thread for small matrices to avoid thread synchronization overhead
+        let config = if data.len() < SINGLE_THREAD_THRESHOLD {
+            ffi::CString::new(r#"{"missing": NaN, "nthread": 1}"#).unwrap()
+        } else {
+            ffi::CString::new(r#"{"missing": NaN}"#).unwrap()
+        };
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSR(
             indptr_cstr.as_ptr(),
@@ -199,23 +209,33 @@ impl DMatrix {
     /// `data[indptr[i]:indptr[i+1]`.
     ///
     /// If `num_rows` is set to None, number of rows will be inferred from given data.
-    pub fn from_csc(indptr: &[usize], indices: &[usize], data: &[f32], num_rows: Option<usize>) -> XGBResult<Self> {
+    ///
+    /// Note: For small matrices (< 30000 non-zero elements), single-threaded creation is used
+    /// to avoid thread synchronization overhead. For larger matrices, multi-threaded creation
+    /// is used for better performance.
+    pub fn from_csc(indptr: &[u64], indices: &[u64], data: &[f32], num_rows: Option<usize>) -> XGBResult<Self> {
+        // Threshold below which single-threaded is faster due to thread overhead.
+        // Benchmarking shows crossover point is around 30k non-zeros on typical hardware.
+        const SINGLE_THREAD_THRESHOLD: usize = 30000;
+
         assert_eq!(indices.len(), data.len());
         let mut handle = ptr::null_mut();
-        let num_rows = num_rows.unwrap_or(0) as xgboost_sys::bst_ulong; // infer from data if 0
+        let num_rows = num_rows.unwrap_or(0) as xgboost_sys::bst_ulong;
 
-        // Convert usize to u64 for cross-platform compatibility with XGBoost's C API
-        let indptr_u64: Vec<u64> = indptr.iter().map(|&x| x as u64).collect();
-        let indices_u64: Vec<u64> = indices.iter().map(|&x| x as u64).collect();
-
-        let indptr_interface = make_array_interface_u64(&indptr_u64);
-        let indices_interface = make_array_interface_u64(&indices_u64);
+        let indptr_interface = make_array_interface_u64(indptr);
+        let indices_interface = make_array_interface_u64(indices);
         let data_interface = make_array_interface_f32(data);
 
         let indptr_cstr = ffi::CString::new(indptr_interface).unwrap();
         let indices_cstr = ffi::CString::new(indices_interface).unwrap();
         let data_cstr = ffi::CString::new(data_interface).unwrap();
-        let config = ffi::CString::new(r#"{"missing": NaN}"#).unwrap();
+
+        // Use single thread for small matrices to avoid thread synchronization overhead
+        let config = if data.len() < SINGLE_THREAD_THRESHOLD {
+            ffi::CString::new(r#"{"missing": NaN, "nthread": 1}"#).unwrap()
+        } else {
+            ffi::CString::new(r#"{"missing": NaN}"#).unwrap()
+        };
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSC(
             indptr_cstr.as_ptr(),
@@ -526,8 +546,8 @@ mod tests {
 
     #[test]
     fn from_csr() {
-        let indptr = [0, 2, 3, 6, 8];
-        let indices = [0, 2, 2, 0, 1, 2, 1, 2];
+        let indptr: [u64; 5] = [0, 2, 3, 6, 8];
+        let indices: [u64; 8] = [0, 2, 2, 0, 1, 2, 1, 2];
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
         let dmat = DMatrix::from_csr(&indptr, &indices, &data, None).unwrap();
@@ -541,8 +561,8 @@ mod tests {
 
     #[test]
     fn from_csc() {
-        let indptr = [0, 2, 3, 6, 8];
-        let indices = [0, 2, 2, 0, 1, 2, 1, 2];
+        let indptr: [u64; 5] = [0, 2, 3, 6, 8];
+        let indices: [u64; 8] = [0, 2, 2, 0, 1, 2, 1, 2];
         let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
         let dmat = DMatrix::from_csc(&indptr, &indices, &data, None).unwrap();
