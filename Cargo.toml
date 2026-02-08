@@ -25,7 +25,7 @@ cuda = ["xgboost-sys/cuda"]
 default  = ["use_prebuilt_xgb"]
 
 [dev-dependencies]
-criterion = "0.8.1"
+criterion = "0.8.2"
 
 [[bench]]
 name = "dmatrix_benchmark"
