@@ -16,14 +16,25 @@ pub type CustomObjective = fn(&[f32], &DMatrix) -> (Vec<f32>, Vec<f32>);
 
 /// Creates a JSON-encoded array interface string for use with XGBoost C API.
 /// This follows the NumPy array interface specification.
-fn make_array_interface(data: &[f32]) -> String {
+fn make_array_interface(data: &[f32], num_rows: usize, n_targets: usize) -> String {
     let ptr = data.as_ptr() as usize;
-    let len = data.len();
-    // Format: {"data": [ptr, read_only], "shape": [len], "typestr": "<f4", "version": 3}
-    // "<f4" means little-endian 4-byte float (f32)
+    // Format: {"data": [ptr, read_only], "shape": [...], "typestr": "<f4", "version": 3}
+    // "<f4" means little-endian 4-byte float (f32).
+    //
+    // For multi-target boosters (num_target > 1, e.g. distributional models
+    // training mu/sigma in one booster) XGBoost requires the gradient/hessian
+    // to be declared as a 2D `[num_row, n_targets]` array. Passing a 1D
+    // `[len]` (where len = num_row * n_targets) trips the C-side check
+    // `i_grad.Shape<0>() == p_fmat->Info().num_row_` in XGBoosterTrainOneIter
+    // because Shape<0> becomes num_row * n_targets instead of num_row.
+    let shape = if n_targets > 1 {
+        format!("[{},{}]", num_rows, n_targets)
+    } else {
+        format!("[{}]", data.len())
+    };
     format!(
-        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<f4","version":3}}"#,
-        ptr, len
+        r#"{{"data":[{},false],"shape":{},"strides":null,"typestr":"<f4","version":3}}"#,
+        ptr, shape
     )
 }
 
@@ -340,8 +351,18 @@ impl Booster {
 
         self.validate_features(dtrain)?;
 
-        let grad_interface = make_array_interface(gradient);
-        let hess_interface = make_array_interface(hessian);
+        // Infer n_targets from the gradient buffer length. Single-target
+        // boosters get a 1D shape `[num_rows]` (unchanged behavior); multi-
+        // target distributional boosters get a 2D shape `[num_rows, n_targets]`.
+        let num_rows = dtrain.num_rows();
+        let n_targets = if num_rows > 0 && !gradient.is_empty() && gradient.len() % num_rows == 0 {
+            gradient.len() / num_rows
+        } else {
+            1
+        };
+
+        let grad_interface = make_array_interface(gradient, num_rows, n_targets);
+        let hess_interface = make_array_interface(hessian, num_rows, n_targets);
 
         let grad_cstr = ffi::CString::new(grad_interface).unwrap();
         let hess_cstr = ffi::CString::new(hess_interface).unwrap();
