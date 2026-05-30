@@ -326,7 +326,7 @@ impl Booster {
     /// * `objective_fn` - custom objective function that returns (gradient, hessian)
     pub fn update_custom(&mut self, dtrain: &DMatrix, iteration: i32, objective_fn: CustomObjective) -> XGBResult<()> {
         let pred = self.predict(dtrain)?;
-        let (gradient, hessian) = objective_fn(&pred.to_vec(), dtrain);
+        let (gradient, hessian) = objective_fn(&pred, dtrain);
         self.boost(dtrain, iteration, &gradient, &hessian)
     }
 
@@ -486,6 +486,22 @@ impl Booster {
         self.get_feature_info("feature_name")
     }
 
+    /// Get the number of feature names stored in this model without allocating the names.
+    ///
+    /// Used on hot paths (e.g. per-iteration validation) where only the count is needed.
+    fn num_feature_names(&self) -> XGBResult<usize> {
+        let mut out_len = 0;
+        let mut out = ptr::null_mut();
+        let field = ffi::CString::new("feature_name").unwrap();
+        xgb_call!(xgboost_sys::XGBoosterGetStrFeatureInfo(
+            self.handle,
+            field.as_ptr(),
+            &mut out_len,
+            &mut out
+        ))?;
+        Ok(out_len as usize)
+    }
+
     /// Get names of features stored in this model.
     pub fn get_feature_info(&self, field: &str) -> XGBResult<Vec<String>> {
         let mut out_len = 0;
@@ -519,12 +535,12 @@ impl Booster {
     pub fn set_feature_info(&self, field: &str, features: &Vec<&str>) -> XGBResult<()> {
         let field: ffi::CString = ffi::CString::new(field).unwrap();
 
-        // We want zero terminated strings
+        // We want zero terminated strings. Keep the owned `CString`s alive in
+        // `c_temp_features` for the duration of the FFI call so the pointers in
+        // `c_feature_ptr` remain valid; they are dropped (and freed) on return.
         let c_temp_features: Vec<ffi::CString> = features.iter().map(|s| ffi::CString::new(*s).unwrap()).collect();
-        let mut c_feature_ptr: Vec<*const raw::c_char> = c_temp_features
-            .into_iter()
-            .map(|s| s.into_raw() as *const raw::c_char)
-            .collect();
+        let mut c_feature_ptr: Vec<*const raw::c_char> =
+            c_temp_features.iter().map(|s| s.as_ptr() as *const raw::c_char).collect();
 
         xgb_call!(xgboost_sys::XGBoosterSetStrFeatureInfo(
             self.handle,
@@ -540,8 +556,8 @@ impl Booster {
     /// the number of columns in the DMatrix. If no feature names are set, this is a no-op.
     /// If the DMatrix has 0 columns (unknown dimensions from CSR/CSC sparse matrices), validation is skipped.
     fn validate_features(&self, dmat: &DMatrix) -> XGBResult<()> {
-        let feature_names = self.get_feature_names()?;
-        if feature_names.is_empty() {
+        let num_features = self.num_feature_names()?;
+        if num_features == 0 {
             // No feature names set, nothing to validate
             return Ok(());
         }
@@ -552,7 +568,6 @@ impl Booster {
             return Ok(());
         }
 
-        let num_features = feature_names.len();
         if num_features != num_cols {
             return Err(XGBError::new(format!(
                 "Feature names mismatch: booster has {} features but DMatrix has {} columns",
