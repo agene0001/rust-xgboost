@@ -1,6 +1,6 @@
-[![Actions Status](https://github.com/marcomq/rust-xgboost/workflows/Macos/badge.svg)](https://github.com/marcomq/rust-xgboost/actions/workflows/macos.yml)
-[![Actions Status](https://github.com/marcomq/rust-xgboost/workflows/Linux/badge.svg)](https://github.com/marcomq/rust-xgboost/actions/workflows/linux.yml)
-[![Actions Status](https://github.com/marcomq/rust-xgboost/workflows/Windows/badge.svg)](https://github.com/marcomq/rust-xgboost/actions/workflows/windows.yml)
+[![Actions Status](https://github.com/agene0001/rust-xgboost/workflows/Macos/badge.svg)](https://github.com/agene0001/rust-xgboost/actions/workflows/macos.yml)
+[![Actions Status](https://github.com/agene0001/rust-xgboost/workflows/Linux/badge.svg)](https://github.com/agene0001/rust-xgboost/actions/workflows/linux.yml)
+[![Actions Status](https://github.com/agene0001/rust-xgboost/workflows/Windows/badge.svg)](https://github.com/agene0001/rust-xgboost/actions/workflows/windows.yml)
 
 
 # rust-xgboost
@@ -92,7 +92,7 @@ fn main() {
 }
 ```
 
-See the [examples](https://github.com/marcomq/rust-xgboost/tree/master/examples) directory for
+See the [examples](https://github.com/agene0001/rust-xgboost/tree/master/examples) directory for
 more detailed examples of different features.
 
 ## Status

@@ -1,0 +1,105 @@
+name: Release XGBoost binaries
+
+# Builds libxgboost from the pinned submodule on every supported target and
+# publishes the libraries as GitHub release assets. xgboost-sys's
+# `use_prebuilt_xgb` feature downloads these (see PREBUILT_RELEASE_URL in
+# xgboost-sys/build.rs — keep its tag in sync with the tag released here).
+#
+# Trigger by pushing a `v*` tag, or manually via workflow_dispatch with the
+# tag to create/update.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update (e.g. v3.2.0)"
+        required: true
+        default: "v3.2.0"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: mac_arm64
+          - os: ubuntu-latest
+            target: linux_amd64
+          - os: ubuntu-22.04-arm
+            target: linux_arm64
+          - os: windows-latest
+            target: win_amd64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp ninja
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cmake -S xgboost-sys/xgboost -B build -DCMAKE_BUILD_TYPE=Release
+          else
+            cmake -S xgboost-sys/xgboost -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # Flat asset names (<target>-<file>) because GitHub release assets have
+      # no directory structure.
+      - name: Collect libraries
+        run: |
+          mkdir -p dist
+          case "${{ matrix.target }}" in
+            mac_arm64)
+              cp "$(find build -name 'libxgboost.dylib' | head -1)" "dist/${{ matrix.target }}-libxgboost.dylib"
+              cp "$(find build -name 'libdmlc.a' | head -1)" "dist/${{ matrix.target }}-libdmlc.a"
+              ;;
+            linux_*)
+              cp "$(find build -name 'libxgboost.so' | head -1)" "dist/${{ matrix.target }}-libxgboost.so"
+              cp "$(find build -name 'libdmlc.a' | head -1)" "dist/${{ matrix.target }}-libdmlc.a"
+              ;;
+            win_amd64)
+              cp "$(find build -name 'xgboost.dll' | head -1)" "dist/${{ matrix.target }}-xgboost.dll"
+              cp "$(find build -name 'xgboost.lib' | head -1)" "dist/${{ matrix.target }}-xgboost.lib"
+              ;;
+          esac
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: dist/*
