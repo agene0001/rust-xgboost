@@ -72,6 +72,7 @@ fn main() {
                     fetch_lib("win_amd64", "xgboost.dll", &deps_path).unwrap();
                     fetch_lib("win_amd64", "xgboost.lib", &deps_path).unwrap();
                 }
+                stage_dll_next_to_exe(Path::new(&format!("{deps_path}/xgboost.dll")), &out_dir);
             } else {
                 if let Ok(homebrew_path) = std::env::var("HOMEBREW_PREFIX") {
                     let xgboost_lib_dir = format!("{}/opt/xgboost/lib", &homebrew_path);
@@ -111,6 +112,10 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
         println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
         println!("cargo:rustc-link-lib=static=dmlc");
+
+        if cfg!(target_os = "windows") {
+            stage_dll_next_to_exe(&dst.join("bin").join("xgboost.dll"), &out_dir);
+        }
     }
 
     // link to appropriate C++ lib
@@ -132,6 +137,30 @@ fn main() {
     {
         println!("cargo:rustc-link-search={}", "/usr/local/cuda/lib64");
         println!("cargo:rustc-link-lib=static=cudart_static");
+    }
+}
+
+/// Windows' loader only searches the exe's directory, system dirs, and PATH —
+/// not the cmake out dir or target/<profile>/deps where the DLL lands, so a
+/// binary run outside `cargo run` (which patches PATH) fails with
+/// "xgboost.dll was not found". Stage a copy in the profile root, where the
+/// final executables are emitted.
+fn stage_dll_next_to_exe(dll_src: &Path, out_dir: &str) {
+    // OUT_DIR = target/<profile>/build/<crate>-<hash>/out → ../../.. = profile root
+    let profile_dir = match dunce::canonicalize(Path::new(&format!("{}/../../..", out_dir))) {
+        Ok(dir) => dir,
+        Err(e) => {
+            println!("cargo:warning=could not resolve profile dir to stage xgboost.dll: {e}");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::copy(dll_src, profile_dir.join("xgboost.dll")) {
+        // Non-fatal: a running executable can hold a lock on the old copy.
+        println!(
+            "cargo:warning=could not stage {} into {}: {e}",
+            dll_src.display(),
+            profile_dir.display()
+        );
     }
 }
 
