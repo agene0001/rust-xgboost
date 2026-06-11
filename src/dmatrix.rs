@@ -1,4 +1,4 @@
-use libc::{c_float, c_uint, c_void};
+use libc::{c_float, c_uint};
 use std::ffi::CStr;
 use std::{ffi, path::Path, ptr, slice};
 
@@ -62,8 +62,9 @@ enum BatchData {
 struct BatchIter {
     /// Batch payload (array interfaces referencing caller data).
     data: BatchData,
-    /// Optional labels as (len, ptr); the pointee must outlive construction.
-    labels: Option<(usize, *const f32)>,
+    /// Optional labels as an array interface; the referenced data must outlive
+    /// construction. Prebuilt so the FFI callback below stays panic-free.
+    labels: Option<ffi::CString>,
     /// Proxy DMatrix the callbacks push data into.
     proxy: xgboost_sys::DMatrixHandle,
     /// Whether the single batch has already been yielded.
@@ -98,17 +99,9 @@ unsafe extern "C" fn batch_iter_next(handle: xgboost_sys::DataIterHandle) -> i32
     if ret != 0 {
         return -1;
     }
-    if let Some((len, ptr)) = it.labels {
-        // type_ = 1 is xgboost's kFloat32, matching the f32 label slice.
-        let ret = unsafe {
-            xgboost_sys::XGDMatrixSetDenseInfo(
-                it.proxy,
-                c"label".as_ptr(),
-                ptr as *const c_void,
-                len as xgboost_sys::bst_ulong,
-                1,
-            )
-        };
+    if let Some(interface) = &it.labels {
+        let ret =
+            unsafe { xgboost_sys::XGDMatrixSetInfoFromInterface(it.proxy, c"label".as_ptr(), interface.as_ptr()) };
         if ret != 0 {
             return -1;
         }
@@ -270,12 +263,7 @@ impl DMatrix {
     ///
     /// Note: a `QuantileDMatrix` is intended for training with `hist`; unlike a
     /// regular `DMatrix` it cannot be serialised with [`save`](Self::save).
-    pub fn from_dense_quantile(
-        data: &[f32],
-        num_rows: usize,
-        labels: Option<&[f32]>,
-        max_bin: u32,
-    ) -> XGBResult<Self> {
+    pub fn from_dense_quantile(data: &[f32], num_rows: usize, labels: Option<&[f32]>, max_bin: u32) -> XGBResult<Self> {
         if let Some(l) = labels {
             assert_eq!(l.len(), num_rows, "labels length must equal num_rows");
         }
@@ -324,7 +312,7 @@ impl DMatrix {
 
         let mut iter = BatchIter {
             data,
-            labels: labels.map(|l| (l.len(), l.as_ptr())),
+            labels: labels.map(|l| ffi::CString::new(make_array_interface_f32(l)).unwrap()),
             proxy,
             yielded: false,
         };

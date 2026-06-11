@@ -9,7 +9,6 @@
 //!
 //! This will output timing results that can be compared against bench_table.rs
 
-
 extern crate xgboost_sys;
 
 /// Generate sparse CSR data with specified dimensions and density.

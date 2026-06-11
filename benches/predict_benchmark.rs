@@ -177,22 +177,31 @@ fn bench_inplace_predict_csr(c: &mut Criterion) {
         let label = format!("{}rows", num_rows);
         let input = (indptr, indices, values);
 
-        group.bench_with_input(BenchmarkId::new("csr_then_predict", &label), &input, |b, (ip, ix, v)| {
-            b.iter(|| {
-                let dmat = DMatrix::from_csr(black_box(ip), black_box(ix), black_box(v), Some(num_features)).unwrap();
-                black_box(booster.predict_matrix(&dmat, &cfg).unwrap())
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("csr_then_predict", &label),
+            &input,
+            |b, (ip, ix, v)| {
+                b.iter(|| {
+                    let dmat =
+                        DMatrix::from_csr(black_box(ip), black_box(ix), black_box(v), Some(num_features)).unwrap();
+                    black_box(booster.predict_matrix(&dmat, &cfg).unwrap())
+                });
+            },
+        );
 
-        group.bench_with_input(BenchmarkId::new("predict_from_csr", &label), &input, |b, (ip, ix, v)| {
-            b.iter(|| {
-                black_box(
-                    booster
-                        .predict_from_csr(black_box(ip), black_box(ix), black_box(v), num_features)
-                        .unwrap(),
-                )
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("predict_from_csr", &label),
+            &input,
+            |b, (ip, ix, v)| {
+                b.iter(|| {
+                    black_box(
+                        booster
+                            .predict_from_csr(black_box(ip), black_box(ix), black_box(v), num_features)
+                            .unwrap(),
+                    )
+                });
+            },
+        );
     }
 
     group.finish();

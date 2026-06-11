@@ -116,9 +116,37 @@ mod predict_config {
 /// in a loop.
 pub struct Booster {
     handle: xgboost_sys::BoosterHandle,
+    /// Lazily-created proxy DMatrix reused across inplace prediction calls
+    /// (`predict_from_dense`/`predict_from_csr`). Passing a proxy to the C API
+    /// avoids it allocating a fresh internal one per call, which measures at
+    /// ~18% of single-row inplace predict latency on a single-thread booster.
+    /// `Booster` is `!Sync` (raw handle field), so `&self` calls cannot race on it.
+    inplace_proxy: std::cell::OnceCell<xgboost_sys::DMatrixHandle>,
 }
 
 impl Booster {
+    /// Wrap a raw booster handle owned by this struct from now on.
+    fn from_handle(handle: xgboost_sys::BoosterHandle) -> Self {
+        Booster {
+            handle,
+            inplace_proxy: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Get the cached proxy DMatrix for inplace prediction, creating it on first use.
+    fn inplace_proxy(&self) -> XGBResult<xgboost_sys::DMatrixHandle> {
+        if let Some(&proxy) = self.inplace_proxy.get() {
+            return Ok(proxy);
+        }
+        let mut proxy = ptr::null_mut();
+        xgb_call!(xgboost_sys::XGProxyDMatrixCreate(&mut proxy))?;
+        // Cannot collide: `!Sync` forbids concurrent calls, and this runs only
+        // when the cell was empty with no other set between (single thread).
+        self.inplace_proxy
+            .set(proxy)
+            .expect("inplace proxy cell set concurrently");
+        Ok(proxy)
+    }
     /// Create a new Booster model with given parameters.
     ///
     /// This model can then be trained using calls to update/boost as appropriate.
@@ -149,7 +177,7 @@ impl Booster {
             &mut handle
         ))?;
 
-        let mut booster = Booster { handle };
+        let mut booster = Booster::from_handle(handle);
         booster.set_params(params)?;
         Ok(booster)
     }
@@ -206,7 +234,7 @@ impl Booster {
             bytes.as_ptr() as *const _,
             bytes.len() as u64
         ))?;
-        Ok(Booster { handle })
+        Ok(Booster::from_handle(handle))
     }
 
     /// Load a Booster from a binary file at given path.
@@ -222,7 +250,7 @@ impl Booster {
         let mut handle = ptr::null_mut();
         xgb_call!(xgboost_sys::XGBoosterCreate(ptr::null(), 0, &mut handle))?;
         xgb_call!(xgboost_sys::XGBoosterLoadModel(handle, fname.as_ptr()))?;
-        Ok(Booster { handle })
+        Ok(Booster::from_handle(handle))
     }
 
     /// Load a Booster directly from a buffer.
@@ -236,7 +264,7 @@ impl Booster {
             bytes.as_ptr() as *const _,
             bytes.len() as u64
         ))?;
-        Ok(Booster { handle })
+        Ok(Booster::from_handle(handle))
     }
 
     /// Convenience function for creating/training a new Booster.
@@ -408,7 +436,7 @@ impl Booster {
         // boosters get a 1D shape `[num_rows]` (unchanged behavior); multi-
         // target distributional boosters get a 2D shape `[num_rows, n_targets]`.
         let num_rows = dtrain.num_rows();
-        let n_targets = if num_rows > 0 && !gradient.is_empty() && gradient.len() % num_rows == 0 {
+        let n_targets = if num_rows > 0 && !gradient.is_empty() && gradient.len().is_multiple_of(num_rows) {
             gradient.len() / num_rows
         } else {
             1
@@ -592,8 +620,10 @@ impl Booster {
         // `c_temp_features` for the duration of the FFI call so the pointers in
         // `c_feature_ptr` remain valid; they are dropped (and freed) on return.
         let c_temp_features: Vec<ffi::CString> = features.iter().map(|s| ffi::CString::new(*s).unwrap()).collect();
-        let mut c_feature_ptr: Vec<*const raw::c_char> =
-            c_temp_features.iter().map(|s| s.as_ptr() as *const raw::c_char).collect();
+        let mut c_feature_ptr: Vec<*const raw::c_char> = c_temp_features
+            .iter()
+            .map(|s| s.as_ptr() as *const raw::c_char)
+            .collect();
 
         xgb_call!(xgboost_sys::XGBoosterSetStrFeatureInfo(
             self.handle,
@@ -680,6 +710,17 @@ impl Booster {
     /// and its shape, mirroring [`predict_matrix`](Self::predict_matrix). NaN is
     /// treated as the missing value, matching `DMatrix::from_dense`.
     ///
+    /// # Latency tuning for small batches
+    ///
+    /// Small-batch latency is dominated by OpenMP thread dispatch inside
+    /// XGBoost, controlled by the booster's `nthread` parameter (default: all
+    /// cores). Pinning the booster to one thread with
+    /// `booster.set_param("nthread", "1")` is much faster for small inputs:
+    /// measured on a 127-feature/50-tree binary model, ~11x for 1 row, ~5x for
+    /// 16 rows, ~2x for 100 rows, while multi-threading wins again from roughly
+    /// 1000 rows up. For latency-sensitive serving of single rows or small
+    /// batches, set `nthread` to 1 once after loading the model.
+    ///
     /// Note: if the booster is configured for a CUDA device, XGBoost falls back
     /// to the DMatrix path with a performance warning (irrelevant for CPU boosters).
     pub fn predict_from_dense(&self, values: &[f32], num_rows: usize) -> XGBResult<(Vec<f32>, Vec<u64>)> {
@@ -698,7 +739,7 @@ impl Booster {
             self.handle,
             values_cstr.as_ptr(),
             predict_config::NORMAL_INPLACE.as_ptr(),
-            ptr::null_mut(), // no proxy DMatrix
+            self.inplace_proxy()?,
             &mut out_shape,
             &mut out_shape_dim,
             &mut out_result
@@ -718,6 +759,10 @@ impl Booster {
     /// stored in `indices[indptr[i]:indptr[i+1]]` with their values at the same
     /// positions in `data`. `num_cols` is the number of features and must match
     /// the model. Returns the prediction data and its shape.
+    ///
+    /// For small batches, see the latency note on
+    /// [`predict_from_dense`](Self::predict_from_dense): setting the booster's
+    /// `nthread` parameter to 1 is much faster below ~1000 rows.
     ///
     /// Note: if the booster is configured for a CUDA device, XGBoost falls back
     /// to the DMatrix path with a performance warning (irrelevant for CPU boosters).
@@ -743,7 +788,7 @@ impl Booster {
             data_cstr.as_ptr(),
             num_cols as xgboost_sys::bst_ulong,
             predict_config::NORMAL_INPLACE.as_ptr(),
-            ptr::null_mut(), // no proxy DMatrix
+            self.inplace_proxy()?,
             &mut out_shape,
             &mut out_shape_dim,
             &mut out_result
@@ -932,6 +977,9 @@ impl Booster {
 
 impl Drop for Booster {
     fn drop(&mut self) {
+        if let Some(&proxy) = self.inplace_proxy.get() {
+            xgb_call!(xgboost_sys::XGDMatrixFree(proxy)).unwrap();
+        }
         xgb_call!(xgboost_sys::XGBoosterFree(self.handle)).unwrap();
     }
 }
@@ -1511,6 +1559,11 @@ mod tests {
         for (a, b) in via_dmatrix.iter().zip(&via_inplace) {
             assert!((a - b).abs() < 1e-6, "inplace CSR predict mismatch: {} vs {}", a, b);
         }
+
+        // Second call goes through the cached proxy DMatrix; results must not change.
+        let (again, shape_again) = bst.predict_from_csr(&indptr, &indices, &values, num_cols).unwrap();
+        assert_eq!(shape_again, shape);
+        assert_eq!(again, via_inplace);
     }
 
     #[test]
@@ -1601,6 +1654,11 @@ mod tests {
         for (a, b) in via_dmatrix.iter().zip(&via_inplace) {
             assert!((a - b).abs() < 1e-6, "inplace predict mismatch: {} vs {}", a, b);
         }
+
+        // Second call goes through the cached proxy DMatrix; results must not change.
+        let (again, shape_again) = bst.predict_from_dense(&data, num_rows).unwrap();
+        assert_eq!(shape_again, shape);
+        assert_eq!(again, via_inplace);
     }
 
     #[test]
