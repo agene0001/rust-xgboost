@@ -17,7 +17,10 @@ const LEGACY_URL: &str = "https://github.com/marcomq/rust-xgboost/raw/refs/tags/
 fn main() {
     let target = env::var("TARGET").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
-    let xgb_root = Path::new("xgboost").canonicalize().unwrap();
+    // dunce strips Windows' \\?\ extended-length prefix, which std's
+    // canonicalize produces and which breaks CMake's file(GLOB) (configure
+    // fails with "No SOURCES given to target: xgboost").
+    let xgb_root = dunce::canonicalize(Path::new("xgboost")).unwrap();
 
     let wrapper_h = xgb_root.join("include").join("xgboost").join("c_api.h");
     let bindings = bindgen::Builder::default()
