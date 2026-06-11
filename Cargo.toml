@@ -31,5 +31,9 @@ criterion = "0.8.2"
 name = "dmatrix_benchmark"
 harness = false
 
+[[bench]]
+name = "predict_benchmark"
+harness = false
+
 [[example]]
 name = "bench_table"

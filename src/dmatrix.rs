@@ -1,16 +1,17 @@
-use libc::{c_float, c_uint};
+use libc::{c_float, c_uint, c_void};
+use std::ffi::CStr;
 use std::{ffi, path::Path, ptr, slice};
 
 use super::{XGBError, XGBResult};
 
-static KEY_GROUP_PTR: &str = "group_ptr";
-static KEY_GROUP: &str = "group";
-static KEY_LABEL: &str = "label";
-static KEY_WEIGHT: &str = "weight";
-static KEY_BASE_MARGIN: &str = "base_margin";
+static KEY_GROUP_PTR: &CStr = c"group_ptr";
+static KEY_GROUP: &CStr = c"group";
+static KEY_LABEL: &CStr = c"label";
+static KEY_WEIGHT: &CStr = c"weight";
+static KEY_BASE_MARGIN: &CStr = c"base_margin";
 
 /// Creates a JSON-encoded array interface string for f32 data.
-fn make_array_interface_f32(data: &[f32]) -> String {
+pub(crate) fn make_array_interface_f32(data: &[f32]) -> String {
     let ptr = data.as_ptr() as usize;
     let len = data.len();
     format!(
@@ -24,7 +25,7 @@ fn make_array_interface_f32(data: &[f32]) -> String {
 /// This function is used for CSR/CSC indices and indptr arrays.
 /// XGBoost's C API expects uint64_t (bst_ulong) for these arrays,
 /// so we use fixed-width u64 to ensure cross-platform compatibility.
-fn make_array_interface_u64(data: &[u64]) -> String {
+pub(crate) fn make_array_interface_u64(data: &[u64]) -> String {
     let ptr = data.as_ptr() as usize;
     let len = data.len();
     format!(
@@ -41,6 +42,85 @@ fn make_array_interface_u32(data: &[u32]) -> String {
         r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"<u4","version":3}}"#,
         ptr, len
     )
+}
+
+/// Payload for a single batch pushed into a proxy DMatrix: either a dense array
+/// interface, or the three CSR array interfaces plus the column count.
+enum BatchData {
+    Dense(ffi::CString),
+    Csr {
+        indptr: ffi::CString,
+        indices: ffi::CString,
+        values: ffi::CString,
+        num_cols: usize,
+    },
+}
+
+/// Single-batch data iterator used to build a `QuantileDMatrix` from an
+/// in-memory matrix via XGBoost's callback API. It yields the whole matrix as a
+/// single batch, then signals end-of-iteration.
+struct BatchIter {
+    /// Batch payload (array interfaces referencing caller data).
+    data: BatchData,
+    /// Optional labels as (len, ptr); the pointee must outlive construction.
+    labels: Option<(usize, *const f32)>,
+    /// Proxy DMatrix the callbacks push data into.
+    proxy: xgboost_sys::DMatrixHandle,
+    /// Whether the single batch has already been yielded.
+    yielded: bool,
+}
+
+/// `next` callback: push the one batch into the proxy, or report end-of-iteration.
+/// Returns 1 while a batch is available, 0 at the end, -1 on failure. Must not
+/// unwind across the FFI boundary, so it avoids any panicking operations.
+unsafe extern "C" fn batch_iter_next(handle: xgboost_sys::DataIterHandle) -> i32 {
+    let it = unsafe { &mut *(handle as *mut BatchIter) };
+    if it.yielded {
+        return 0;
+    }
+    let ret = match &it.data {
+        BatchData::Dense(interface) => unsafe { xgboost_sys::XGProxyDMatrixSetDataDense(it.proxy, interface.as_ptr()) },
+        BatchData::Csr {
+            indptr,
+            indices,
+            values,
+            num_cols,
+        } => unsafe {
+            xgboost_sys::XGProxyDMatrixSetDataCSR(
+                it.proxy,
+                indptr.as_ptr(),
+                indices.as_ptr(),
+                values.as_ptr(),
+                *num_cols as xgboost_sys::bst_ulong,
+            )
+        },
+    };
+    if ret != 0 {
+        return -1;
+    }
+    if let Some((len, ptr)) = it.labels {
+        // type_ = 1 is xgboost's kFloat32, matching the f32 label slice.
+        let ret = unsafe {
+            xgboost_sys::XGDMatrixSetDenseInfo(
+                it.proxy,
+                c"label".as_ptr(),
+                ptr as *const c_void,
+                len as xgboost_sys::bst_ulong,
+                1,
+            )
+        };
+        if ret != 0 {
+            return -1;
+        }
+    }
+    it.yielded = true;
+    1
+}
+
+/// `reset` callback: rewind so the batch can be yielded again.
+unsafe extern "C" fn batch_iter_reset(handle: xgboost_sys::DataIterHandle) {
+    let it = unsafe { &mut *(handle as *mut BatchIter) };
+    it.yielded = false;
 }
 
 /// Data matrix used throughout XGBoost for training/predicting [`Booster`](struct.Booster.html) models.
@@ -143,15 +223,135 @@ impl DMatrix {
     /// let dmat = DMatrix::from_dense(data, num_rows).unwrap();
     /// ```
     pub fn from_dense(data: &[f32], num_rows: usize) -> XGBResult<Self> {
+        // Three-way benchmark of the dense creation APIs
+        // (benches/dmatrix_benchmark.rs, `from_dense` group):
+        //   - XGDMatrixCreateFromMat: fastest below ~50k elements (no thread setup)
+        //   - XGDMatrixCreateFromMat_omp: fastest above (~1.5x the array-interface
+        //     XGDMatrixCreateFromDense at 500k+, ~5x plain CreateFromMat)
+        // Neither is deprecated, so dispatch on the measured crossover. NaN is the
+        // missing value in both paths, matching historical behavior.
+        const PARALLEL_THRESHOLD: usize = 50_000;
+
         let mut handle = ptr::null_mut();
-        xgb_call!(xgboost_sys::XGDMatrixCreateFromMat(
-            data.as_ptr(),
-            num_rows as xgboost_sys::bst_ulong,
-            (data.len() / num_rows) as xgboost_sys::bst_ulong,
-            f32::NAN,
-            &mut handle
-        ))?;
+        let num_cols = (data.len() / num_rows) as xgboost_sys::bst_ulong;
+
+        if data.len() < PARALLEL_THRESHOLD {
+            xgb_call!(xgboost_sys::XGDMatrixCreateFromMat(
+                data.as_ptr(),
+                num_rows as xgboost_sys::bst_ulong,
+                num_cols,
+                f32::NAN,
+                &mut handle
+            ))?;
+        } else {
+            xgb_call!(xgboost_sys::XGDMatrixCreateFromMat_omp(
+                data.as_ptr(),
+                num_rows as xgboost_sys::bst_ulong,
+                num_cols,
+                f32::NAN,
+                &mut handle,
+                0 // <=0 means use all available cores
+            ))?;
+        }
         DMatrix::new(handle)
+    }
+
+    /// Create a `QuantileDMatrix` from a dense row-major matrix.
+    ///
+    /// A `QuantileDMatrix` stores the data pre-binned for the `hist` tree method
+    /// (the XGBoost default), using far less memory than a regular `DMatrix`
+    /// (~1 byte per feature value instead of 4) and skipping a separate sketching
+    /// pass during training. Prefer it for large in-memory training sets.
+    ///
+    /// `max_bin` must match the booster's `max_bin` training parameter (default
+    /// 256), otherwise training errors out. Labels, when given, are attached
+    /// during construction (the supported path for quantile matrices) and must
+    /// have length `num_rows`.
+    ///
+    /// Note: a `QuantileDMatrix` is intended for training with `hist`; unlike a
+    /// regular `DMatrix` it cannot be serialised with [`save`](Self::save).
+    pub fn from_dense_quantile(
+        data: &[f32],
+        num_rows: usize,
+        labels: Option<&[f32]>,
+        max_bin: u32,
+    ) -> XGBResult<Self> {
+        if let Some(l) = labels {
+            assert_eq!(l.len(), num_rows, "labels length must equal num_rows");
+        }
+        let num_cols = data.len() / num_rows;
+        let ptr = data.as_ptr() as usize;
+        let data_interface = format!(
+            r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
+            ptr, num_rows, num_cols
+        );
+        let data_cstr = ffi::CString::new(data_interface).unwrap();
+
+        Self::quantile_from_batch(BatchData::Dense(data_cstr), labels, max_bin)
+    }
+
+    /// Create a `QuantileDMatrix` from a sparse CSR matrix, the sparse
+    /// counterpart of [`from_dense_quantile`](Self::from_dense_quantile).
+    ///
+    /// Same CSR layout as [`from_csr`](Self::from_csr); `num_cols` is required
+    /// (the proxy DMatrix cannot infer it). See `from_dense_quantile` for the
+    /// `max_bin`/labels semantics and usage caveats.
+    pub fn from_csr_quantile(
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: usize,
+        labels: Option<&[f32]>,
+        max_bin: u32,
+    ) -> XGBResult<Self> {
+        assert_eq!(indices.len(), data.len());
+        if let Some(l) = labels {
+            assert_eq!(l.len(), indptr.len() - 1, "labels length must equal num_rows");
+        }
+        let batch = BatchData::Csr {
+            indptr: ffi::CString::new(make_array_interface_u64(indptr)).unwrap(),
+            indices: ffi::CString::new(make_array_interface_u64(indices)).unwrap(),
+            values: ffi::CString::new(make_array_interface_f32(data)).unwrap(),
+            num_cols,
+        };
+        Self::quantile_from_batch(batch, labels, max_bin)
+    }
+
+    /// Shared `QuantileDMatrix` construction from a single prepared batch.
+    fn quantile_from_batch(data: BatchData, labels: Option<&[f32]>, max_bin: u32) -> XGBResult<Self> {
+        let mut proxy = ptr::null_mut();
+        xgb_call!(xgboost_sys::XGProxyDMatrixCreate(&mut proxy))?;
+
+        let mut iter = BatchIter {
+            data,
+            labels: labels.map(|l| (l.len(), l.as_ptr())),
+            proxy,
+            yielded: false,
+        };
+
+        let config = format!(r#"{{"missing": NaN, "max_bin": {}}}"#, max_bin);
+        let config_cstr = ffi::CString::new(config).unwrap();
+
+        let mut out = ptr::null_mut();
+        // SAFETY: `iter` outlives the (synchronous) call; the callbacks only ever
+        // dereference the handle we pass and never unwind across the boundary.
+        let ret = unsafe {
+            xgboost_sys::XGQuantileDMatrixCreateFromCallback(
+                &mut iter as *mut BatchIter as xgboost_sys::DataIterHandle,
+                proxy,
+                ptr::null_mut(), // no reference matrix for quantile alignment
+                Some(batch_iter_reset),
+                Some(batch_iter_next),
+                config_cstr.as_ptr(),
+                &mut out,
+            )
+        };
+
+        // Free the proxy regardless of outcome; surface the create error first.
+        let proxy_free = unsafe { xgboost_sys::XGDMatrixFree(proxy) };
+        XGBError::check_return_value(ret)?;
+        XGBError::check_return_value(proxy_free)?;
+        DMatrix::new(out)
     }
 
     /// Create a new `DMatrix` from a sparse
@@ -184,10 +384,10 @@ impl DMatrix {
         let data_cstr = ffi::CString::new(data_interface).unwrap();
 
         // Use single thread for small matrices to avoid thread synchronization overhead
-        let config = if data.len() < SINGLE_THREAD_THRESHOLD {
-            ffi::CString::new(r#"{"missing": NaN, "nthread": 1}"#).unwrap()
+        let config: &CStr = if data.len() < SINGLE_THREAD_THRESHOLD {
+            cr#"{"missing": NaN, "nthread": 1}"#
         } else {
-            ffi::CString::new(r#"{"missing": NaN}"#).unwrap()
+            cr#"{"missing": NaN}"#
         };
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSR(
@@ -231,10 +431,10 @@ impl DMatrix {
         let data_cstr = ffi::CString::new(data_interface).unwrap();
 
         // Use single thread for small matrices to avoid thread synchronization overhead
-        let config = if data.len() < SINGLE_THREAD_THRESHOLD {
-            ffi::CString::new(r#"{"missing": NaN, "nthread": 1}"#).unwrap()
+        let config: &CStr = if data.len() < SINGLE_THREAD_THRESHOLD {
+            cr#"{"missing": NaN, "nthread": 1}"#
         } else {
-            ffi::CString::new(r#"{"missing": NaN}"#).unwrap()
+            cr#"{"missing": NaN}"#
         };
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSC(
@@ -392,8 +592,7 @@ impl DMatrix {
         self.get_uint_info(KEY_GROUP_PTR)
     }
 
-    fn get_float_info(&self, field: &str) -> XGBResult<&[f32]> {
-        let field = ffi::CString::new(field).unwrap();
+    fn get_float_info(&self, field: &CStr) -> XGBResult<&[f32]> {
         let mut out_len = 0;
         let mut out_dptr = ptr::null();
         xgb_call!(xgboost_sys::XGDMatrixGetFloatInfo(
@@ -410,8 +609,7 @@ impl DMatrix {
         }
     }
 
-    fn set_float_info(&mut self, field: &str, array: &[f32]) -> XGBResult<()> {
-        let field = ffi::CString::new(field).unwrap();
+    fn set_float_info(&mut self, field: &CStr, array: &[f32]) -> XGBResult<()> {
         xgb_call!(xgboost_sys::XGDMatrixSetFloatInfo(
             self.handle,
             field.as_ptr(),
@@ -420,8 +618,7 @@ impl DMatrix {
         ))
     }
 
-    fn get_uint_info(&self, field: &str) -> XGBResult<&[u32]> {
-        let field = ffi::CString::new(field).unwrap();
+    fn get_uint_info(&self, field: &CStr) -> XGBResult<&[u32]> {
         let mut out_len = 0;
         let mut out_dptr = ptr::null();
         xgb_call!(xgboost_sys::XGDMatrixGetUIntInfo(
@@ -438,8 +635,7 @@ impl DMatrix {
         }
     }
 
-    fn set_uint_info(&mut self, field: &str, array: &[u32]) -> XGBResult<()> {
-        let field = ffi::CString::new(field).unwrap();
+    fn set_uint_info(&mut self, field: &CStr, array: &[u32]) -> XGBResult<()> {
         let array_interface = make_array_interface_u32(array);
         let data_cstr = ffi::CString::new(array_interface).unwrap();
         xgb_call!(xgboost_sys::XGDMatrixSetInfoFromInterface(
@@ -572,6 +768,28 @@ mod tests {
         let dmat = DMatrix::from_csc(&indptr, &indices, &data, Some(10)).unwrap();
         assert_eq!(dmat.num_rows(), 10);
         assert_eq!(dmat.num_cols(), 4);
+    }
+
+    #[test]
+    fn from_dense_quantile() {
+        let num_rows = 50;
+        let num_cols = 4;
+        let mut data = vec![0f32; num_rows * num_cols];
+        let mut labels = vec![0f32; num_rows];
+        for i in 0..num_rows {
+            for j in 0..num_cols {
+                data[i * num_cols + j] = ((i * 3 + j) % 17) as f32;
+            }
+            labels[i] = (i % 2) as f32;
+        }
+
+        let qdm = DMatrix::from_dense_quantile(&data, num_rows, Some(&labels), 64).unwrap();
+        assert_eq!(qdm.shape(), (num_rows, num_cols));
+        assert_eq!(qdm.get_labels().unwrap(), &labels[..]);
+
+        // Labels are optional.
+        let qdm = DMatrix::from_dense_quantile(&data, num_rows, None, 64).unwrap();
+        assert_eq!(qdm.shape(), (num_rows, num_cols));
     }
 
     #[test]

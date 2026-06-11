@@ -163,6 +163,110 @@ fn free_dmatrix(handle: xgboost_sys::DMatrixHandle) {
     }
 }
 
+/// Generate a dense row-major matrix of the given shape.
+fn generate_dense_data(num_rows: usize, num_cols: usize) -> Vec<f32> {
+    let mut seed: u64 = 6789;
+    (0..num_rows * num_cols)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed as f64 / u64::MAX as f64) as f32
+        })
+        .collect()
+}
+
+/// Old path: legacy, hardcoded single-threaded XGDMatrixCreateFromMat.
+fn from_dense_legacy_mat(data: &[f32], num_rows: usize) -> Result<xgboost_sys::DMatrixHandle, i32> {
+    let mut handle = ptr::null_mut();
+    let ret = unsafe {
+        xgboost_sys::XGDMatrixCreateFromMat(
+            data.as_ptr(),
+            num_rows as xgboost_sys::bst_ulong,
+            (data.len() / num_rows) as xgboost_sys::bst_ulong,
+            f32::NAN,
+            &mut handle,
+        )
+    };
+    if ret == 0 { Ok(handle) } else { Err(ret) }
+}
+
+/// Legacy parallel path: XGDMatrixCreateFromMat_omp with default thread count.
+fn from_dense_legacy_mat_omp(data: &[f32], num_rows: usize) -> Result<xgboost_sys::DMatrixHandle, i32> {
+    let mut handle = ptr::null_mut();
+    let ret = unsafe {
+        xgboost_sys::XGDMatrixCreateFromMat_omp(
+            data.as_ptr(),
+            num_rows as xgboost_sys::bst_ulong,
+            (data.len() / num_rows) as xgboost_sys::bst_ulong,
+            f32::NAN,
+            &mut handle,
+            0, // 0 = use omp default thread count
+        )
+    };
+    if ret == 0 { Ok(handle) } else { Err(ret) }
+}
+
+/// New path: array-interface XGDMatrixCreateFromDense with single/multi-thread
+/// auto-tuning, mirroring DMatrix::from_dense.
+fn from_dense_array_interface(data: &[f32], num_rows: usize) -> Result<xgboost_sys::DMatrixHandle, i32> {
+    const SINGLE_THREAD_THRESHOLD: usize = 30000;
+    let mut handle = ptr::null_mut();
+    let num_cols = data.len() / num_rows;
+    let ptr = data.as_ptr() as usize;
+    let data_interface = format!(
+        r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
+        ptr, num_rows, num_cols
+    );
+    let data_json = ffi::CString::new(data_interface).unwrap();
+    let config = if data.len() < SINGLE_THREAD_THRESHOLD {
+        ffi::CString::new(r#"{"missing": NaN, "nthread": 1}"#).unwrap()
+    } else {
+        ffi::CString::new(r#"{"missing": NaN}"#).unwrap()
+    };
+    let ret = unsafe { xgboost_sys::XGDMatrixCreateFromDense(data_json.as_ptr(), config.as_ptr(), &mut handle) };
+    if ret == 0 { Ok(handle) } else { Err(ret) }
+}
+
+fn bench_from_dense(c: &mut Criterion) {
+    let mut group = c.benchmark_group("from_dense");
+
+    // (num_rows, num_cols, label) -> num_rows * num_cols elements
+    let test_cases = [
+        (1000, 10, "10k_elems"),   // below 30k threshold
+        (5000, 10, "50k_elems"),   // above threshold
+        (10000, 50, "500k_elems"), // large
+        (50000, 50, "2.5M_elems"), // xlarge
+    ];
+
+    for (num_rows, num_cols, label) in test_cases {
+        let data = generate_dense_data(num_rows, num_cols);
+
+        group.bench_with_input(BenchmarkId::new("legacy_CreateFromMat", label), &data, |b, data| {
+            b.iter(|| {
+                let handle = from_dense_legacy_mat(black_box(data), num_rows).unwrap();
+                free_dmatrix(handle);
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("legacy_CreateFromMat_omp", label), &data, |b, data| {
+            b.iter(|| {
+                let handle = from_dense_legacy_mat_omp(black_box(data), num_rows).unwrap();
+                free_dmatrix(handle);
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("array_CreateFromDense", label), &data, |b, data| {
+            b.iter(|| {
+                let handle = from_dense_array_interface(black_box(data), num_rows).unwrap();
+                free_dmatrix(handle);
+            })
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_from_csr(c: &mut Criterion) {
     let mut group = c.benchmark_group("from_csr");
 
@@ -323,7 +427,7 @@ fn print_comparison_table() {
     println!();
 }
 
-criterion_group!(benches, bench_from_csr);
+criterion_group!(benches, bench_from_dense, bench_from_csr);
 criterion_main!(benches);
 
 // Allow running the table printer directly

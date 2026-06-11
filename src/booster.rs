@@ -1,7 +1,8 @@
 use crate::dmatrix::DMatrix;
 use crate::error::XGBError;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::raw;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -36,15 +37,6 @@ fn make_array_interface(data: &[f32], num_rows: usize, n_targets: usize) -> Stri
         r#"{{"data":[{},false],"shape":{},"strides":null,"typestr":"<f4","version":3}}"#,
         ptr, shape
     )
-}
-
-/// Used to control the return type of predictions made by C Booster API.
-enum PredictOption {
-    OutputMargin,
-    PredictLeaf,
-    PredictContribitions,
-    //ApproximateContributions,
-    PredictInteractions,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -82,23 +74,35 @@ impl PredictConfig {
     }
 }
 
-impl PredictOption {
-    /// Convert list of options into a bit mask.
-    fn options_as_mask(options: &[PredictOption]) -> i32 {
-        let mut option_mask = 0x00;
-        for option in options {
-            let value = match *option {
-                PredictOption::OutputMargin => 0x01,
-                PredictOption::PredictLeaf => 0x02,
-                PredictOption::PredictContribitions => 0x04,
-                //PredictOption::ApproximateContributions => 0x08,
-                PredictOption::PredictInteractions => 0x10,
-            };
-            option_mask |= value;
-        }
+/// NUL-terminated `XGBoosterPredictFromDMatrix` config strings, one per prediction
+/// type. These mirror what [`PredictConfig::as_json`] would produce, kept as
+/// `&'static CStr` literals so the prediction paths (including the per-round
+/// training hot path) allocate nothing. `iteration_end: 0` means "use all trees",
+/// matching the old `ntree_limit = 0`; `strict_shape: false` preserves the legacy
+/// output layouts that the return-shape calculations below depend on.
+mod predict_config {
+    use std::ffi::CStr;
 
-        option_mask
-    }
+    /// Normal prediction (type 0). Used by `predict` and the training hot path.
+    pub const NORMAL: &CStr =
+        cr#"{"type":0,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
+    /// Normal inplace prediction (type 0). Inplace predict additionally accepts a
+    /// `missing` field; NaN matches the missing value used by `DMatrix`.
+    pub const NORMAL_INPLACE: &CStr =
+        cr#"{"type":0,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"missing":NaN}"#;
+    /// Output margin (type 1). The `training: true` flag is preserved from the
+    /// legacy `XGBoosterPredict` call this replaces.
+    pub const MARGIN: &CStr =
+        cr#"{"type":1,"training":true,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
+    /// SHAP feature contributions (type 2).
+    pub const CONTRIBUTIONS: &CStr =
+        cr#"{"type":2,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
+    /// SHAP feature interactions (type 4).
+    pub const INTERACTIONS: &CStr =
+        cr#"{"type":4,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
+    /// Predicted leaf indices (type 6).
+    pub const LEAF: &CStr =
+        cr#"{"type":6,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
 }
 
 /// Core model in XGBoost, containing functions for training, evaluating and predicting.
@@ -174,6 +178,37 @@ impl Booster {
         Ok(buffer)
     }
 
+    /// Serialise this Booster's full state (model + internal configuration) to a
+    /// memory snapshot buffer (`XGBoosterSerializeToBuffer`).
+    ///
+    /// Unlike [`save_buffer`](Self::save_buffer), which encodes the model alone
+    /// in a stable on-disk format, this is a raw snapshot intended for
+    /// checkpointing within the same XGBoost version; restore it with
+    /// [`unserialize_from_buffer`](Self::unserialize_from_buffer).
+    pub fn serialize_to_buffer(&self) -> XGBResult<Vec<u8>> {
+        let mut out_len: xgboost_sys::bst_ulong = 0;
+        let mut out_buffer = ptr::null();
+        xgb_call!(xgboost_sys::XGBoosterSerializeToBuffer(
+            self.handle,
+            &mut out_len,
+            &mut out_buffer
+        ))?;
+        Ok(unsafe { slice::from_raw_parts(out_buffer as *const u8, out_len as usize).to_vec() })
+    }
+
+    /// Restore a Booster from a [`serialize_to_buffer`](Self::serialize_to_buffer)
+    /// snapshot. Must be the same XGBoost version that produced the snapshot.
+    pub fn unserialize_from_buffer(bytes: &[u8]) -> XGBResult<Self> {
+        let mut handle = ptr::null_mut();
+        xgb_call!(xgboost_sys::XGBoosterCreate(ptr::null(), 0, &mut handle))?;
+        xgb_call!(xgboost_sys::XGBoosterUnserializeFromBuffer(
+            handle,
+            bytes.as_ptr() as *const _,
+            bytes.len() as u64
+        ))?;
+        Ok(Booster { handle })
+    }
+
     /// Load a Booster from a binary file at given path.
     pub fn load<P: AsRef<Path>>(path: P) -> XGBResult<Self> {
         debug!("Loading Booster from: {}", path.as_ref().display());
@@ -244,8 +279,10 @@ impl Booster {
                 if let Some(eval_fn) = params.custom_evaluation_fn {
                     let eval_name = "custom";
                     for (dmat, dmat_name) in eval_sets {
-                        let margin = bst.predict_margin(dmat)?;
-                        let eval_result = eval_fn(&margin, dmat);
+                        // Borrow XGBoost's margin buffer; `eval_fn` consumes it
+                        // before the next booster call, so no copy is needed.
+                        let margin = bst.predict_margin_borrowed(dmat)?;
+                        let eval_result = eval_fn(margin, dmat);
                         let eval_results = dmat_eval_results
                             .entry(eval_name.to_string())
                             .or_insert_with(IndexMap::new);
@@ -262,13 +299,15 @@ impl Booster {
                     }
                 }
 
-                print!("[{}]", i);
+                // Build the line once and emit it with a single write, instead of
+                // taking the stdout lock several times per boosting round.
+                let mut line = format!("[{}]", i);
                 for (eval_name, dmat_results) in eval_dmat_results {
                     for (dmat_name, result) in dmat_results {
-                        print!("\t{}-{}:{}", dmat_name, eval_name, result);
+                        let _ = write!(line, "\t{}-{}:{}", dmat_name, eval_name, result);
                     }
                 }
-                println!();
+                println!("{}", line);
 
                 Some(dmat_eval_results)
             } else {
@@ -294,6 +333,16 @@ impl Booster {
         }
 
         Ok(bst)
+    }
+
+    /// Release the data caches XGBoost accumulated during training (XGBoost 3.0+).
+    ///
+    /// The trained model is unaffected; only internal training caches (gradient
+    /// buffers, prediction caches for the training matrices) are freed. Call this
+    /// after training when keeping the booster around for inference to reduce its
+    /// resident memory.
+    pub fn reset(&mut self) -> XGBResult<()> {
+        xgb_call!(xgboost_sys::XGBoosterReset(self.handle))
     }
 
     /// Update this Booster's parameters.
@@ -325,8 +374,12 @@ impl Booster {
     /// * `iteration` - current iteration number
     /// * `objective_fn` - custom objective function that returns (gradient, hessian)
     pub fn update_custom(&mut self, dtrain: &DMatrix, iteration: i32, objective_fn: CustomObjective) -> XGBResult<()> {
-        let pred = self.predict(dtrain)?;
-        let (gradient, hessian) = objective_fn(&pred, dtrain);
+        // Borrow XGBoost's internal prediction buffer directly rather than
+        // copying it into a Vec. The buffer is valid until the next prediction
+        // call on this booster, and `objective_fn` consumes it (returning owned
+        // gradient/hessian Vecs) before `boost` runs, so no copy is needed.
+        let pred = self.predict_borrowed(dtrain)?;
+        let (gradient, hessian) = objective_fn(pred, dtrain);
         self.boost(dtrain, iteration, &gradient, &hessian)
     }
 
@@ -492,7 +545,7 @@ impl Booster {
     fn num_feature_names(&self) -> XGBResult<usize> {
         let mut out_len = 0;
         let mut out = ptr::null_mut();
-        let field = ffi::CString::new("feature_name").unwrap();
+        let field = c"feature_name";
         xgb_call!(xgboost_sys::XGBoosterGetStrFeatureInfo(
             self.handle,
             field.as_ptr(),
@@ -583,79 +636,152 @@ impl Booster {
     /// config_json should be a 0 terminated string, preferred created by PredictConfig::as_json
     /// Returns an array containing one entry per row in the given data and its shape as array.
     pub fn predict_matrix(&self, dmat: &DMatrix, config_json: &str) -> XGBResult<(Vec<f32>, Vec<u64>)> {
-        let str_buffer: std::ffi::CString;
+        let str_buffer: ffi::CString;
         let cfg = if !config_json.is_empty() && config_json.ends_with('\u{0}') {
-            unsafe { std::ffi::CStr::from_ptr(config_json.as_ptr() as *const raw::c_char) }
+            unsafe { ffi::CStr::from_ptr(config_json.as_ptr() as *const raw::c_char) }
         } else {
-            str_buffer = std::ffi::CString::new(config_json).unwrap();
+            str_buffer = ffi::CString::new(config_json).unwrap();
             str_buffer.as_c_str()
         };
+        let (data, shape) = self.predict_raw(dmat, cfg)?;
+        Ok((data.to_vec(), shape.to_vec()))
+    }
+
+    /// Core prediction via `XGBoosterPredictFromDMatrix`.
+    ///
+    /// Returns the prediction data and its shape as slices borrowed from buffers
+    /// owned by this booster; both are only valid until the next prediction call
+    /// on it (XGBoost reuses the buffers). Callers that need the data to outlive
+    /// subsequent calls must copy it. `config` must be a NUL-terminated JSON string.
+    fn predict_raw(&self, dmat: &DMatrix, config: &ffi::CStr) -> XGBResult<(&[f32], &[u64])> {
         let mut out_shape = ptr::null();
         let mut out_shape_dim = 0;
         let mut out_result = ptr::null();
         xgb_call!(xgboost_sys::XGBoosterPredictFromDMatrix(
             self.handle,
             dmat.handle,
-            cfg.as_ptr() as *const raw::c_char,
+            config.as_ptr(),
             &mut out_shape,
             &mut out_shape_dim,
             &mut out_result
         ))?;
         assert!(!out_result.is_null());
-        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize).to_vec() };
-        let mut data_size = 1;
-        for dim in &shape {
-            data_size *= dim;
-        }
-        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize).to_vec() };
-
+        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
+        let data_size: u64 = shape.iter().product();
+        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
         Ok((data, shape))
+    }
+
+    /// Predict directly from a dense, row-major `[num_rows, num_cols]` slice
+    /// without constructing a [`DMatrix`] first (XGBoost "inplace" prediction).
+    ///
+    /// For online serving of small batches this avoids the DMatrix build, which
+    /// dominates end-to-end latency at that scale. Returns the prediction data
+    /// and its shape, mirroring [`predict_matrix`](Self::predict_matrix). NaN is
+    /// treated as the missing value, matching `DMatrix::from_dense`.
+    ///
+    /// Note: if the booster is configured for a CUDA device, XGBoost falls back
+    /// to the DMatrix path with a performance warning (irrelevant for CPU boosters).
+    pub fn predict_from_dense(&self, values: &[f32], num_rows: usize) -> XGBResult<(Vec<f32>, Vec<u64>)> {
+        let num_cols = values.len() / num_rows;
+        let ptr = values.as_ptr() as usize;
+        let values_interface = format!(
+            r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
+            ptr, num_rows, num_cols
+        );
+        let values_cstr = ffi::CString::new(values_interface).unwrap();
+
+        let mut out_shape = ptr::null();
+        let mut out_shape_dim = 0;
+        let mut out_result = ptr::null();
+        xgb_call!(xgboost_sys::XGBoosterPredictFromDense(
+            self.handle,
+            values_cstr.as_ptr(),
+            predict_config::NORMAL_INPLACE.as_ptr(),
+            ptr::null_mut(), // no proxy DMatrix
+            &mut out_shape,
+            &mut out_shape_dim,
+            &mut out_result
+        ))?;
+        assert!(!out_result.is_null());
+        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
+        let data_size: u64 = shape.iter().product();
+        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
+        Ok((data.to_vec(), shape.to_vec()))
+    }
+
+    /// Predict directly from a sparse CSR matrix without constructing a
+    /// [`DMatrix`] first (XGBoost "inplace" prediction), the sparse counterpart
+    /// of [`predict_from_dense`](Self::predict_from_dense).
+    ///
+    /// Uses standard CSR representation where the column indices for row _i_ are
+    /// stored in `indices[indptr[i]:indptr[i+1]]` with their values at the same
+    /// positions in `data`. `num_cols` is the number of features and must match
+    /// the model. Returns the prediction data and its shape.
+    ///
+    /// Note: if the booster is configured for a CUDA device, XGBoost falls back
+    /// to the DMatrix path with a performance warning (irrelevant for CPU boosters).
+    pub fn predict_from_csr(
+        &self,
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: usize,
+    ) -> XGBResult<(Vec<f32>, Vec<u64>)> {
+        assert_eq!(indices.len(), data.len());
+        let indptr_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_u64(indptr)).unwrap();
+        let indices_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_u64(indices)).unwrap();
+        let data_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_f32(data)).unwrap();
+
+        let mut out_shape = ptr::null();
+        let mut out_shape_dim = 0;
+        let mut out_result = ptr::null();
+        xgb_call!(xgboost_sys::XGBoosterPredictFromCSR(
+            self.handle,
+            indptr_cstr.as_ptr(),
+            indices_cstr.as_ptr(),
+            data_cstr.as_ptr(),
+            num_cols as xgboost_sys::bst_ulong,
+            predict_config::NORMAL_INPLACE.as_ptr(),
+            ptr::null_mut(), // no proxy DMatrix
+            &mut out_shape,
+            &mut out_shape_dim,
+            &mut out_result
+        ))?;
+        assert!(!out_result.is_null());
+        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
+        let data_size: u64 = shape.iter().product();
+        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
+        Ok((data.to_vec(), shape.to_vec()))
     }
 
     /// Predict results for given data.
     ///
     /// Returns an array containing one entry per row in the given data.
-    /// Uses old call to XGBoosterPredict
     pub fn predict(&self, dmat: &DMatrix) -> XGBResult<Vec<f32>> {
-        let option_mask = PredictOption::options_as_mask(&[]);
-        let ntree_limit = 0;
-        let mut out_len = 0;
-        let mut out_result = ptr::null();
-        xgb_call!(xgboost_sys::XGBoosterPredict(
-            self.handle,
-            dmat.handle,
-            option_mask,
-            ntree_limit,
-            0,
-            &mut out_len,
-            &mut out_result
-        ))?;
+        Ok(self.predict_borrowed(dmat)?.to_vec())
+    }
 
-        assert!(!out_result.is_null());
-        let data = unsafe { slice::from_raw_parts(out_result, out_len as usize).to_vec() };
-        Ok(data)
+    /// Predict results for given data, borrowing XGBoost's internal output buffer.
+    ///
+    /// The returned slice points into a buffer owned by this booster and is only
+    /// valid until the next prediction call on it. Callers must copy the data if
+    /// they need it to outlive subsequent booster calls (see [`predict`]).
+    fn predict_borrowed(&self, dmat: &DMatrix) -> XGBResult<&[f32]> {
+        Ok(self.predict_raw(dmat, predict_config::NORMAL)?.0)
     }
 
     /// Predict margin for given data.
     ///
     /// Returns an array containing one entry per row in the given data.
     pub fn predict_margin(&self, dmat: &DMatrix) -> XGBResult<Vec<f32>> {
-        let option_mask = PredictOption::options_as_mask(&[PredictOption::OutputMargin]);
-        let ntree_limit = 0;
-        let mut out_len = 0;
-        let mut out_result = ptr::null();
-        xgb_call!(xgboost_sys::XGBoosterPredict(
-            self.handle,
-            dmat.handle,
-            option_mask,
-            ntree_limit,
-            1,
-            &mut out_len,
-            &mut out_result
-        ))?;
-        assert!(!out_result.is_null());
-        let data = unsafe { slice::from_raw_parts(out_result, out_len as usize).to_vec() };
-        Ok(data)
+        Ok(self.predict_margin_borrowed(dmat)?.to_vec())
+    }
+
+    /// Margin prediction borrowing XGBoost's internal output buffer; same
+    /// validity contract as [`predict_borrowed`](Self::predict_borrowed).
+    fn predict_margin_borrowed(&self, dmat: &DMatrix) -> XGBResult<&[f32]> {
+        Ok(self.predict_raw(dmat, predict_config::MARGIN)?.0)
     }
 
     /// Get predicted leaf index for each sample in given data.
@@ -664,22 +790,7 @@ impl Booster {
     ///
     /// Note: the leaf index of a tree is unique per tree, so e.g. leaf 1 could be found in both tree 1 and tree 0.
     pub fn predict_leaf(&self, dmat: &DMatrix) -> XGBResult<(Vec<f32>, (usize, usize))> {
-        let option_mask = PredictOption::options_as_mask(&[PredictOption::PredictLeaf]);
-        let ntree_limit = 0;
-        let mut out_len = 0;
-        let mut out_result = ptr::null();
-        xgb_call!(xgboost_sys::XGBoosterPredict(
-            self.handle,
-            dmat.handle,
-            option_mask,
-            ntree_limit,
-            0,
-            &mut out_len,
-            &mut out_result
-        ))?;
-        assert!(!out_result.is_null());
-
-        let data = unsafe { slice::from_raw_parts(out_result, out_len as usize).to_vec() };
+        let data = self.predict_raw(dmat, predict_config::LEAF)?.0.to_vec();
         let num_rows = dmat.num_rows();
         let num_cols = data.len() / num_rows;
         Ok((data, (num_rows, num_cols)))
@@ -693,22 +804,7 @@ impl Booster {
     /// Returns an array of shape (number of samples, number of features + 1) as a tuple of
     /// (data, num_rows). The final column contains the bias term.
     pub fn predict_contributions(&self, dmat: &DMatrix) -> XGBResult<(Vec<f32>, (usize, usize))> {
-        let option_mask = PredictOption::options_as_mask(&[PredictOption::PredictContribitions]);
-        let ntree_limit = 0;
-        let mut out_len = 0;
-        let mut out_result = ptr::null();
-        xgb_call!(xgboost_sys::XGBoosterPredict(
-            self.handle,
-            dmat.handle,
-            option_mask,
-            ntree_limit,
-            0,
-            &mut out_len,
-            &mut out_result
-        ))?;
-        assert!(!out_result.is_null());
-
-        let data = unsafe { slice::from_raw_parts(out_result, out_len as usize).to_vec() };
+        let data = self.predict_raw(dmat, predict_config::CONTRIBUTIONS)?.0.to_vec();
         let num_rows = dmat.num_rows();
         let num_cols = data.len() / num_rows;
         Ok((data, (num_rows, num_cols)))
@@ -723,22 +819,7 @@ impl Booster {
     /// Returns an array of shape (number of samples, number of features + 1, number of features + 1).
     /// The final row and column contain the bias terms.
     pub fn predict_interactions(&self, dmat: &DMatrix) -> XGBResult<(Vec<f32>, (usize, usize, usize))> {
-        let option_mask = PredictOption::options_as_mask(&[PredictOption::PredictInteractions]);
-        let ntree_limit = 0;
-        let mut out_len = 0;
-        let mut out_result = ptr::null();
-        xgb_call!(xgboost_sys::XGBoosterPredict(
-            self.handle,
-            dmat.handle,
-            option_mask,
-            ntree_limit,
-            0,
-            &mut out_len,
-            &mut out_result
-        ))?;
-        assert!(!out_result.is_null());
-
-        let data = unsafe { slice::from_raw_parts(out_result, out_len as usize).to_vec() };
+        let data = self.predict_raw(dmat, predict_config::INTERACTIONS)?.0.to_vec();
         let num_rows = dmat.num_rows();
 
         let dim = ((data.len() / num_rows) as f64).sqrt() as usize;
@@ -757,14 +838,16 @@ impl Booster {
             };
 
             let file_path = tmp_dir.path().join("fmap.json");
-            let mut file: File = match File::create(&file_path) {
+            let file: File = match File::create(&file_path) {
                 Ok(f) => f,
                 Err(err) => return Err(XGBError::new(err.to_string())),
             };
 
+            let mut writer = BufWriter::new(file);
             for (feature_num, (feature_name, feature_type)) in &fmap.0 {
-                writeln!(file, "{}\t{}\t{}", feature_num, feature_name, feature_type).unwrap();
+                writeln!(writer, "{}\t{}\t{}", feature_num, feature_name, feature_type).unwrap();
             }
+            writer.flush().unwrap();
 
             self.dump_model_fmap(with_statistics, Some(&file_path))
         } else {
@@ -1338,6 +1421,215 @@ mod tests {
         let num_samples = dmat_test.num_rows();
         let num_features = dmat_train.num_cols();
         assert_eq!(shape, (num_samples, num_features + 1, num_features + 1));
+    }
+
+    /// Build a deterministic dense binary-classification dataset.
+    fn synthetic_dense(num_rows: usize, num_cols: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut data = vec![0f32; num_rows * num_cols];
+        let mut labels = vec![0f32; num_rows];
+        let mut seed = 1u64;
+        for i in 0..num_rows {
+            let mut acc = 0f32;
+            for j in 0..num_cols {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let v = (seed % 1000) as f32 / 1000.0;
+                data[i * num_cols + j] = v;
+                acc += v;
+            }
+            labels[i] = if acc > num_cols as f32 / 2.0 { 1.0 } else { 0.0 };
+        }
+        (data, labels)
+    }
+
+    fn hist_binary_params(max_bin: u32) -> BoosterParameters {
+        let tree_params = tree::TreeBoosterParametersBuilder::default()
+            .tree_method(tree::TreeMethod::Hist)
+            .max_depth(4)
+            .max_bin(max_bin)
+            .build()
+            .unwrap();
+        let learning_params = learning::LearningTaskParametersBuilder::default()
+            .objective(learning::Objective::BinaryLogistic)
+            .build()
+            .unwrap();
+        parameters::BoosterParametersBuilder::default()
+            .booster_type(parameters::BoosterType::Tree(tree_params))
+            .learning_params(learning_params)
+            .verbose(false)
+            .build()
+            .unwrap()
+    }
+
+    /// Build a deterministic sparse CSR binary-classification dataset.
+    fn synthetic_csr(num_rows: usize, num_cols: usize) -> (Vec<u64>, Vec<u64>, Vec<f32>, Vec<f32>) {
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        let mut labels = vec![0f32; num_rows];
+        let mut seed = 7u64;
+        let mut nnz = 0u64;
+        for i in 0..num_rows {
+            let mut acc = 0f32;
+            for j in 0..num_cols {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                // ~40% density
+                if seed % 10 < 4 {
+                    let v = (seed % 1000) as f32 / 1000.0;
+                    indices.push(j as u64);
+                    values.push(v);
+                    acc += v;
+                    nnz += 1;
+                }
+            }
+            indptr.push(nnz);
+            labels[i] = if acc > 1.0 { 1.0 } else { 0.0 };
+        }
+        (indptr, indices, values, labels)
+    }
+
+    #[test]
+    fn predict_from_csr_matches_dmatrix() {
+        let (num_rows, num_cols) = (256, 8);
+        let (indptr, indices, values, labels) = synthetic_csr(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_csr(&indptr, &indices, &values, Some(num_cols)).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let via_dmatrix = bst.predict(&dm).unwrap();
+        let (via_inplace, shape) = bst.predict_from_csr(&indptr, &indices, &values, num_cols).unwrap();
+
+        assert_eq!(shape, vec![num_rows as u64]);
+        assert_eq!(via_dmatrix.len(), via_inplace.len());
+        for (a, b) in via_dmatrix.iter().zip(&via_inplace) {
+            assert!((a - b).abs() < 1e-6, "inplace CSR predict mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn quantile_csr_matches_csr_training() {
+        let (num_rows, num_cols) = (512, 8);
+        let (indptr, indices, values, labels) = synthetic_csr(num_rows, num_cols);
+        let params = hist_binary_params(256);
+
+        // Regular CSR DMatrix + hist.
+        let mut dm = DMatrix::from_csr(&indptr, &indices, &values, Some(num_cols)).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst_dm = Booster::new_with_cached_dmats(&params, &[&dm]).unwrap();
+        for i in 0..10 {
+            bst_dm.update(&dm, i).unwrap();
+        }
+        let pred_dm = bst_dm.predict(&dm).unwrap();
+
+        // QuantileDMatrix built from the same CSR data.
+        let qdm = DMatrix::from_csr_quantile(&indptr, &indices, &values, num_cols, Some(&labels), 256).unwrap();
+        assert_eq!(qdm.shape(), (num_rows, num_cols));
+        assert_eq!(qdm.get_labels().unwrap(), &labels[..]);
+        let mut bst_q = Booster::new_with_cached_dmats(&params, &[&qdm]).unwrap();
+        for i in 0..10 {
+            bst_q.update(&qdm, i).unwrap();
+        }
+        let pred_q = bst_q.predict(&qdm).unwrap();
+
+        assert_eq!(pred_dm.len(), pred_q.len());
+        for (a, b) in pred_dm.iter().zip(&pred_q) {
+            assert!((a - b).abs() < 1e-4, "quantile vs CSR pred mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn serialize_unserialize_roundtrip() {
+        let (num_rows, num_cols) = (256, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let before = bst.predict(&dm).unwrap();
+        let snapshot = bst.serialize_to_buffer().unwrap();
+        let restored = Booster::unserialize_from_buffer(&snapshot).unwrap();
+        let after = restored.predict(&dm).unwrap();
+        assert_eq!(before, after, "snapshot restore must reproduce predictions exactly");
+    }
+
+    #[test]
+    fn reset_keeps_model() {
+        let (num_rows, num_cols) = (256, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let before = bst.predict(&dm).unwrap();
+        bst.reset().unwrap();
+        let after = bst.predict(&dm).unwrap();
+        assert_eq!(before, after, "reset must not change the trained model");
+    }
+
+    #[test]
+    fn predict_from_dense_matches_dmatrix() {
+        let (num_rows, num_cols) = (256, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let via_dmatrix = bst.predict(&dm).unwrap();
+        let (via_inplace, shape) = bst.predict_from_dense(&data, num_rows).unwrap();
+
+        assert_eq!(shape, vec![num_rows as u64]);
+        assert_eq!(via_dmatrix.len(), via_inplace.len());
+        for (a, b) in via_dmatrix.iter().zip(&via_inplace) {
+            assert!((a - b).abs() < 1e-6, "inplace predict mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn quantile_dmatrix_matches_dense_training() {
+        let (num_rows, num_cols) = (512, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+        let params = hist_binary_params(256);
+
+        // Regular DMatrix + hist (which bins internally with max_bin=256).
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst_dm = Booster::new_with_cached_dmats(&params, &[&dm]).unwrap();
+        for i in 0..10 {
+            bst_dm.update(&dm, i).unwrap();
+        }
+        let pred_dm = bst_dm.predict(&dm).unwrap();
+
+        // QuantileDMatrix carrying the same binning.
+        let qdm = DMatrix::from_dense_quantile(&data, num_rows, Some(&labels), 256).unwrap();
+        let mut bst_q = Booster::new_with_cached_dmats(&params, &[&qdm]).unwrap();
+        for i in 0..10 {
+            bst_q.update(&qdm, i).unwrap();
+        }
+        let pred_q = bst_q.predict(&qdm).unwrap();
+
+        assert_eq!(pred_dm.len(), pred_q.len());
+        for (a, b) in pred_dm.iter().zip(&pred_q) {
+            assert!((a - b).abs() < 1e-4, "quantile vs dense pred mismatch: {} vs {}", a, b);
+        }
     }
 
     #[test]
