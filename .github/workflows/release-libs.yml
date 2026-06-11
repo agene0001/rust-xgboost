@@ -65,22 +65,33 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       # Flat asset names (<target>-<file>) because GitHub release assets have
-      # no directory structure.
+      # no directory structure. xgboost's CMake links the main library into
+      # <source-dir>/lib (not the build dir); libdmlc.a stays under build/,
+      # so both roots are searched.
       - name: Collect libraries
         run: |
           mkdir -p dist
+          collect() {
+            src="$(find build xgboost-sys/xgboost/lib -name "$1" 2>/dev/null | head -1)"
+            if [ -z "$src" ]; then
+              echo "ERROR: $1 not found under build/ or xgboost-sys/xgboost/lib/"
+              exit 1
+            fi
+            echo "collecting $src"
+            cp "$src" "dist/${{ matrix.target }}-$1"
+          }
           case "${{ matrix.target }}" in
             mac_arm64)
-              cp "$(find build -name 'libxgboost.dylib' | head -1)" "dist/${{ matrix.target }}-libxgboost.dylib"
-              cp "$(find build -name 'libdmlc.a' | head -1)" "dist/${{ matrix.target }}-libdmlc.a"
+              collect libxgboost.dylib
+              collect libdmlc.a
               ;;
             linux_*)
-              cp "$(find build -name 'libxgboost.so' | head -1)" "dist/${{ matrix.target }}-libxgboost.so"
-              cp "$(find build -name 'libdmlc.a' | head -1)" "dist/${{ matrix.target }}-libdmlc.a"
+              collect libxgboost.so
+              collect libdmlc.a
               ;;
             win_amd64)
-              cp "$(find build -name 'xgboost.dll' | head -1)" "dist/${{ matrix.target }}-xgboost.dll"
-              cp "$(find build -name 'xgboost.lib' | head -1)" "dist/${{ matrix.target }}-xgboost.lib"
+              collect xgboost.dll
+              collect xgboost.lib
               ;;
           esac
           ls -la dist
