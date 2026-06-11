@@ -57,6 +57,7 @@ fn main() {
                     fetch_lib("mac_arm64", "libxgboost.dylib", &deps_path).unwrap();
                     fetch_lib("mac_arm64", "libdmlc.a", &deps_path).unwrap();
                 }
+                stage_lib_next_to_exe(Path::new(&format!("{deps_path}/libxgboost.dylib")), &out_dir);
             } else if cfg!(target_os = "linux") {
                 let target_dir = if cfg!(target_arch = "aarch64") {
                     "linux_arm64"
@@ -67,12 +68,13 @@ fn main() {
                     fetch_lib(target_dir, "libxgboost.so", &deps_path).unwrap();
                     fetch_lib(target_dir, "libdmlc.a", &deps_path).unwrap();
                 }
+                stage_lib_next_to_exe(Path::new(&format!("{deps_path}/libxgboost.so")), &out_dir);
             } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
                 if !std::fs::exists(format!("{deps_path}/xgboost.dll")).unwrap() {
                     fetch_lib("win_amd64", "xgboost.dll", &deps_path).unwrap();
                     fetch_lib("win_amd64", "xgboost.lib", &deps_path).unwrap();
                 }
-                stage_dll_next_to_exe(Path::new(&format!("{deps_path}/xgboost.dll")), &out_dir);
+                stage_lib_next_to_exe(Path::new(&format!("{deps_path}/xgboost.dll")), &out_dir);
             } else {
                 if let Ok(homebrew_path) = std::env::var("HOMEBREW_PREFIX") {
                     let xgboost_lib_dir = format!("{}/opt/xgboost/lib", &homebrew_path);
@@ -113,8 +115,26 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
         println!("cargo:rustc-link-lib=static=dmlc");
 
-        if cfg!(target_os = "windows") {
-            stage_dll_next_to_exe(&dst.join("bin").join("xgboost.dll"), &out_dir);
+        let lib_file = if target.contains("windows") {
+            "xgboost.dll"
+        } else if target.contains("apple") {
+            "libxgboost.dylib"
+        } else {
+            "libxgboost.so"
+        };
+        // cmake emits the runtime library under bin/ on Windows and lib/ (or
+        // lib64/ on some distros) elsewhere.
+        let candidates = [
+            dst.join("bin").join(lib_file),
+            dst.join("lib").join(lib_file),
+            dst.join("lib64").join(lib_file),
+        ];
+        match candidates.iter().find(|p| p.exists()) {
+            Some(src) => stage_lib_next_to_exe(src, &out_dir),
+            None => println!(
+                "cargo:warning=built {lib_file} not found under {} — cannot stage it next to the executables",
+                dst.display()
+            ),
         }
     }
 
@@ -140,25 +160,34 @@ fn main() {
     }
 }
 
-/// Windows' loader only searches the exe's directory, system dirs, and PATH —
-/// not the cmake out dir or target/<profile>/deps where the DLL lands, so a
-/// binary run outside `cargo run` (which patches PATH) fails with
-/// "xgboost.dll was not found". Stage a copy in the profile root, where the
-/// final executables are emitted.
-fn stage_dll_next_to_exe(dll_src: &Path, out_dir: &str) {
+/// The dynamic loader does not search the cmake out dir or
+/// target/<profile>/deps where the library lands, so binaries run outside
+/// `cargo run` (which patches PATH / LD_LIBRARY_PATH /
+/// DYLD_FALLBACK_LIBRARY_PATH) fail to find it. Stage a copy in the profile
+/// root, where the final executables are emitted. On Windows that alone fixes
+/// it — the loader searches the exe's directory. On Linux/macOS the loader
+/// only looks next to the exe if the binary carries an $ORIGIN/@loader_path
+/// rpath, and Cargo does not propagate link-args from dependency build
+/// scripts, so the binary crate must add that itself — see "Running binaries
+/// outside cargo run" in the README.
+fn stage_lib_next_to_exe(lib_src: &Path, out_dir: &str) {
+    let lib_name = lib_src.file_name().unwrap();
     // OUT_DIR = target/<profile>/build/<crate>-<hash>/out → ../../.. = profile root
     let profile_dir = match dunce::canonicalize(Path::new(&format!("{}/../../..", out_dir))) {
         Ok(dir) => dir,
         Err(e) => {
-            println!("cargo:warning=could not resolve profile dir to stage xgboost.dll: {e}");
+            println!(
+                "cargo:warning=could not resolve profile dir to stage {}: {e}",
+                lib_name.display()
+            );
             return;
         }
     };
-    if let Err(e) = std::fs::copy(dll_src, profile_dir.join("xgboost.dll")) {
+    if let Err(e) = std::fs::copy(lib_src, profile_dir.join(lib_name)) {
         // Non-fatal: a running executable can hold a lock on the old copy.
         println!(
             "cargo:warning=could not stage {} into {}: {e}",
-            dll_src.display(),
+            lib_src.display(),
             profile_dir.display()
         );
     }

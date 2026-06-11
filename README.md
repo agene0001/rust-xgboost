@@ -130,6 +130,49 @@ brew commands for MacOs to compile locally:
 - brew install ninja
 - brew install llvm
 
+### Running binaries outside `cargo run`
+
+libxgboost is linked dynamically. `cargo run` and `cargo test` always work
+because Cargo adds the library's directory to the loader's environment
+(`PATH` / `LD_LIBRARY_PATH` / `DYLD_FALLBACK_LIBRARY_PATH`) for the child
+process — but a binary started directly (e.g. `./target/release/myapp`) gets
+no such help.
+
+To support that, the build script stages the shared library
+(`xgboost.dll` / `libxgboost.so` / `libxgboost.dylib`) next to the
+executables in the target profile directory, for both the `local_build` and
+`use_prebuilt_xgb` paths.
+
+On **Windows** that is sufficient — the loader searches the exe's directory.
+
+On **Linux/macOS** the loader only looks next to the exe if the binary
+carries an `$ORIGIN` / `@loader_path` rpath. Cargo does not propagate linker
+args from dependency build scripts, so the *binary* crate has to add it
+itself. Either in the binary crate's `build.rs`:
+
+```rust
+fn main() {
+    let target = std::env::var("TARGET").unwrap();
+    if target.contains("linux") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    } else if target.contains("apple") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+    }
+}
+```
+
+or in its `.cargo/config.toml`:
+
+```toml
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path"]
+```
+
+When deploying, copy the staged library alongside the executable.
+
 ### Supported Platforms
 
 Prebuilt lib and built locally:
