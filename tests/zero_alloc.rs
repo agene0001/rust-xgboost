@@ -6,20 +6,35 @@
 //! is +/-10-30%), so the property is asserted directly with a counting global
 //! allocator instead. Only the Rust wrapper's allocations are counted; the C++
 //! side of XGBoost does not go through Rust's `#[global_allocator]`.
+//!
+//! The counter is per-thread: the libtest harness runs tests on parallel
+//! threads and prints progress from its own, and with a process-global counter
+//! those allocations bleed into the measurement window (this flaked on the
+//! Windows/Linux CI runners, whose debug-build timing overlapped the tests).
+//! Each test also hammers the allocator from a background thread while
+//! measuring, so that immunity is itself under test rather than a matter of
+//! scheduling luck.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use xgb::parameters::{self, learning, tree};
 use xgb::{Booster, DMatrix};
 
 struct CountingAlloc;
 
-static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Allocations made by the current thread. `const` init keeps first
+    /// access inside the allocator hook allocation-free.
+    static THREAD_ALLOCS: Cell<usize> = const { Cell::new(0) };
+}
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        // try_with: never panic (and so abort) inside the allocator, even for
+        // allocations during thread teardown.
+        let _ = THREAD_ALLOCS.try_with(|count| count.set(count.get() + 1));
         unsafe { System.alloc(layout) }
     }
 
@@ -28,7 +43,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = THREAD_ALLOCS.try_with(|count| count.set(count.get() + 1));
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -36,8 +51,29 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
+/// Allocations made so far by the calling thread.
 fn allocations() -> usize {
-    ALLOC_COUNT.load(Ordering::Relaxed)
+    THREAD_ALLOCS.with(Cell::get)
+}
+
+/// Run `measured` while a background thread allocates in a tight loop,
+/// returning the number of allocations the *current* thread made inside it.
+/// The noise thread reproduces, deterministically, the concurrent-allocation
+/// conditions that made a process-global counter flake in CI.
+fn count_own_allocations(measured: impl FnOnce()) -> usize {
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(Ordering::Relaxed) {
+                std::hint::black_box(vec![0u8; 64]);
+            }
+        });
+        let before = allocations();
+        measured();
+        let after = allocations();
+        stop.store(true, Ordering::Relaxed);
+        after - before
+    })
 }
 
 /// Deterministic dense binary-classification dataset.
@@ -126,18 +162,14 @@ fn inplace_predict_into_is_allocation_free_when_warm() {
     bst.predict_from_dense_into(single_row, 1, &mut out).unwrap();
     let expected = out.clone();
 
-    let before = allocations();
-    for _ in 0..100 {
-        bst.predict_from_dense_into(single_row, 1, &mut out).unwrap();
-    }
-    let after = allocations();
+    let allocs = count_own_allocations(|| {
+        for _ in 0..100 {
+            bst.predict_from_dense_into(single_row, 1, &mut out).unwrap();
+        }
+    });
 
     assert_eq!(out, expected, "warm calls must keep producing identical predictions");
-    assert_eq!(
-        after - before,
-        0,
-        "predict_from_dense_into must not allocate once warm"
-    );
+    assert_eq!(allocs, 0, "predict_from_dense_into must not allocate once warm");
 }
 
 #[test]
@@ -160,17 +192,13 @@ fn inplace_csr_predict_into_is_allocation_free_when_warm() {
         .unwrap();
     let expected = out.clone();
 
-    let before = allocations();
-    for _ in 0..100 {
-        bst.predict_from_csr_into(row_indptr, row_indices, row_values, num_cols, &mut out)
-            .unwrap();
-    }
-    let after = allocations();
+    let allocs = count_own_allocations(|| {
+        for _ in 0..100 {
+            bst.predict_from_csr_into(row_indptr, row_indices, row_values, num_cols, &mut out)
+                .unwrap();
+        }
+    });
 
     assert_eq!(out, expected, "warm calls must keep producing identical predictions");
-    assert_eq!(
-        after - before,
-        0,
-        "predict_from_csr_into must not allocate once warm"
-    );
+    assert_eq!(allocs, 0, "predict_from_csr_into must not allocate once warm");
 }
