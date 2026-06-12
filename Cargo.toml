@@ -32,6 +32,13 @@ cuda = ["xgboost-sys/cuda"]
 # `--no-default-features --features use_prebuilt_xgb` for the download path.
 default = ["local_build"]
 
+[lints.rust]
+# bench_deprecated/dmatrix_benchmark gate manual comparison modes behind
+# features this crate deliberately does not declare (deprecated_api needs a
+# pre-3.1 XGBoost to even compile). Teach check-cfg they are expected so
+# builds don't warn about them.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("deprecated_api", "print_table"))'] }
+
 [dev-dependencies]
 criterion = "0.8.2"
 

@@ -333,6 +333,7 @@ fn bench_from_csr(c: &mut Criterion) {
 
 /// Print a formatted comparison table after benchmarks complete.
 /// Run this separately with: cargo run --release --example bench_table
+#[cfg(feature = "print_table")]
 fn print_comparison_table() {
     use std::time::Instant;
 

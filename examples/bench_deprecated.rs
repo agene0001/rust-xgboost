@@ -13,6 +13,7 @@ extern crate xgboost_sys;
 
 /// Generate sparse CSR data with specified dimensions and density.
 /// Uses the same algorithm as bench_table.rs for reproducibility.
+#[cfg(feature = "deprecated_api")]
 fn generate_sparse_data(num_rows: usize, num_cols: usize, density: f64) -> (Vec<u64>, Vec<u64>, Vec<f32>) {
     let mut indptr = vec![0u64];
     let mut indices = Vec::new();
