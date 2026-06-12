@@ -99,6 +99,33 @@ fn main() {
         // RelWithDebInfo's -O2 leaves performance on the table in the hot loops.
         let dst = dst.define("CMAKE_BUILD_TYPE", "Release");
 
+        // Opt-in performance flags for the libxgboost build, off by default so
+        // the produced binaries stay portable across CPUs of the architecture.
+        //
+        // XGB_BUILD_NATIVE=1 tunes codegen for the build machine. Only valid
+        // when the binary runs where it was built (clang spells the flag
+        // -mcpu=native on aarch64 and -march=native elsewhere).
+        println!("cargo:rerun-if-env-changed=XGB_BUILD_NATIVE");
+        if env::var("XGB_BUILD_NATIVE").is_ok_and(|v| v == "1") {
+            let flag = if target.contains("aarch64") {
+                "-mcpu=native"
+            } else {
+                "-march=native"
+            };
+            dst.cflag(flag).cxxflag(flag);
+        }
+        // XGB_BUILD_IPO=1 enables link-time optimization (CMake IPO) for the
+        // C++ build. Passed explicitly as ON/OFF rather than only when set:
+        // -D values persist in CMakeCache.txt across reconfigures, so an
+        // explicit OFF is required for unsetting the env var to take effect.
+        println!("cargo:rerun-if-env-changed=XGB_BUILD_IPO");
+        let ipo = if env::var("XGB_BUILD_IPO").is_ok_and(|v| v == "1") {
+            "ON"
+        } else {
+            "OFF"
+        };
+        let dst = dst.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", ipo);
+
         #[cfg(feature = "cuda")]
         let mut dst = dst
             .define("USE_CUDA", "ON")

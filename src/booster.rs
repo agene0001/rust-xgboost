@@ -105,6 +105,76 @@ mod predict_config {
         cr#"{"type":6,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
 }
 
+/// Fixed-capacity stack buffer for building short NUL-terminated FFI strings
+/// (array-interface JSON) without heap allocation on prediction hot paths.
+///
+/// The array-interface templates plus three 20-digit integers (max `usize`)
+/// total under 140 bytes, so the 192-byte buffers used below cannot overflow;
+/// `write_str` still checks and errors rather than truncating, reserving the
+/// final byte for the NUL terminator.
+struct CBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> CBuf<N> {
+    fn new() -> Self {
+        CBuf { buf: [0; N], len: 0 }
+    }
+
+    /// NUL-terminate the accumulated bytes and view them as a `&CStr`.
+    fn as_cstr(&mut self) -> &ffi::CStr {
+        // In-bounds: write_str reserves the final byte for this terminator.
+        self.buf[self.len] = 0;
+        ffi::CStr::from_bytes_with_nul(&self.buf[..=self.len]).expect("JSON written to CBuf contains no interior NUL")
+    }
+}
+
+impl<const N: usize> fmt::Write for CBuf<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        // >= reserves the final byte for the NUL terminator
+        if self.len + bytes.len() >= N {
+            return Err(fmt::Error);
+        }
+        self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+/// Buffer size used for all array-interface JSON built on the stack.
+const ARRAY_INTERFACE_BUF: usize = 192;
+
+/// Write a 1D array-interface JSON (`typestr` per the NumPy spec, e.g. `"<f4"`,
+/// `"<u8"`) into `buf` and return it NUL-terminated.
+fn write_interface_1d<'a>(
+    buf: &'a mut CBuf<ARRAY_INTERFACE_BUF>,
+    ptr: usize,
+    len: usize,
+    typestr: &str,
+) -> &'a ffi::CStr {
+    write!(
+        buf,
+        r#"{{"data":[{},false],"shape":[{}],"strides":null,"typestr":"{}","version":3}}"#,
+        ptr, len, typestr
+    )
+    .expect("array-interface JSON exceeds stack buffer");
+    buf.as_cstr()
+}
+
+/// Write a 2D row-major f32 array-interface JSON into `buf` and return it
+/// NUL-terminated.
+fn write_interface_2d(buf: &mut CBuf<ARRAY_INTERFACE_BUF>, ptr: usize, rows: usize, cols: usize) -> &ffi::CStr {
+    write!(
+        buf,
+        r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
+        ptr, rows, cols
+    )
+    .expect("array-interface JSON exceeds stack buffer");
+    buf.as_cstr()
+}
+
 /// Core model in XGBoost, containing functions for training, evaluating and predicting.
 ///
 /// Usually created through the [`train`](struct.Booster.html#method.train) function, which
@@ -724,13 +794,31 @@ impl Booster {
     /// Note: if the booster is configured for a CUDA device, XGBoost falls back
     /// to the DMatrix path with a performance warning (irrelevant for CPU boosters).
     pub fn predict_from_dense(&self, values: &[f32], num_rows: usize) -> XGBResult<(Vec<f32>, Vec<u64>)> {
+        let (data, shape) = self.inplace_predict_dense_raw(values, num_rows)?;
+        Ok((data.to_vec(), shape.to_vec()))
+    }
+
+    /// Like [`predict_from_dense`](Self::predict_from_dense), but writes the
+    /// predictions into `out` (cleared first) instead of returning a fresh `Vec`.
+    ///
+    /// Reusing one buffer across calls makes the steady-state serving loop
+    /// allocation-free. The output length is `num_rows * n_groups` (`n_groups`
+    /// is 1 for regression/binary models), so the per-row group count is
+    /// recoverable as `out.len() / num_rows`.
+    pub fn predict_from_dense_into(&self, values: &[f32], num_rows: usize, out: &mut Vec<f32>) -> XGBResult<()> {
+        let (data, _shape) = self.inplace_predict_dense_raw(values, num_rows)?;
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Dense inplace prediction via `XGBoosterPredictFromDense`, returning
+    /// slices borrowed from booster-owned buffers (same validity contract as
+    /// [`predict_raw`](Self::predict_raw): valid until the next prediction call).
+    fn inplace_predict_dense_raw(&self, values: &[f32], num_rows: usize) -> XGBResult<(&[f32], &[u64])> {
         let num_cols = values.len() / num_rows;
-        let ptr = values.as_ptr() as usize;
-        let values_interface = format!(
-            r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
-            ptr, num_rows, num_cols
-        );
-        let values_cstr = ffi::CString::new(values_interface).unwrap();
+        let mut values_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let values_cstr = write_interface_2d(&mut values_buf, values.as_ptr() as usize, num_rows, num_cols);
 
         let mut out_shape = ptr::null();
         let mut out_shape_dim = 0;
@@ -748,7 +836,7 @@ impl Booster {
         let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
         let data_size: u64 = shape.iter().product();
         let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
-        Ok((data.to_vec(), shape.to_vec()))
+        Ok((data, shape))
     }
 
     /// Predict directly from a sparse CSR matrix without constructing a
@@ -773,10 +861,45 @@ impl Booster {
         data: &[f32],
         num_cols: usize,
     ) -> XGBResult<(Vec<f32>, Vec<u64>)> {
+        let (data, shape) = self.inplace_predict_csr_raw(indptr, indices, data, num_cols)?;
+        Ok((data.to_vec(), shape.to_vec()))
+    }
+
+    /// Like [`predict_from_csr`](Self::predict_from_csr), but writes the
+    /// predictions into `out` (cleared first) instead of returning a fresh `Vec`;
+    /// see [`predict_from_dense_into`](Self::predict_from_dense_into) for the
+    /// buffer-reuse rationale and output layout.
+    pub fn predict_from_csr_into(
+        &self,
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: usize,
+        out: &mut Vec<f32>,
+    ) -> XGBResult<()> {
+        let (data, _shape) = self.inplace_predict_csr_raw(indptr, indices, data, num_cols)?;
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// CSR inplace prediction via `XGBoosterPredictFromCSR`, returning slices
+    /// borrowed from booster-owned buffers (same validity contract as
+    /// [`predict_raw`](Self::predict_raw): valid until the next prediction call).
+    fn inplace_predict_csr_raw(
+        &self,
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: usize,
+    ) -> XGBResult<(&[f32], &[u64])> {
         assert_eq!(indices.len(), data.len());
-        let indptr_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_u64(indptr)).unwrap();
-        let indices_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_u64(indices)).unwrap();
-        let data_cstr = ffi::CString::new(crate::dmatrix::make_array_interface_f32(data)).unwrap();
+        let mut indptr_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let mut indices_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let mut data_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let indptr_cstr = write_interface_1d(&mut indptr_buf, indptr.as_ptr() as usize, indptr.len(), "<u8");
+        let indices_cstr = write_interface_1d(&mut indices_buf, indices.as_ptr() as usize, indices.len(), "<u8");
+        let data_cstr = write_interface_1d(&mut data_buf, data.as_ptr() as usize, data.len(), "<f4");
 
         let mut out_shape = ptr::null();
         let mut out_shape_dim = 0;
@@ -797,7 +920,7 @@ impl Booster {
         let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
         let data_size: u64 = shape.iter().product();
         let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
-        Ok((data.to_vec(), shape.to_vec()))
+        Ok((data, shape))
     }
 
     /// Predict results for given data.
@@ -1659,6 +1782,70 @@ mod tests {
         let (again, shape_again) = bst.predict_from_dense(&data, num_rows).unwrap();
         assert_eq!(shape_again, shape);
         assert_eq!(again, via_inplace);
+    }
+
+    #[test]
+    fn predict_from_dense_into_matches_and_reuses_buffer() {
+        let (num_rows, num_cols) = (64, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let (owned, _shape) = bst.predict_from_dense(&data, num_rows).unwrap();
+
+        let mut out = Vec::new();
+        bst.predict_from_dense_into(&data, num_rows, &mut out).unwrap();
+        assert_eq!(out, owned);
+
+        // A smaller second batch must overwrite (not append) and reuse capacity.
+        let half_rows = num_rows / 2;
+        let cap_before = out.capacity();
+        bst.predict_from_dense_into(&data[..half_rows * num_cols], half_rows, &mut out)
+            .unwrap();
+        assert_eq!(out.len(), half_rows);
+        assert_eq!(out.capacity(), cap_before, "buffer must be reused, not reallocated");
+        assert_eq!(out[..], owned[..half_rows], "row predictions are independent of batch size");
+    }
+
+    #[test]
+    fn predict_from_csr_into_matches_and_reuses_buffer() {
+        let (num_rows, num_cols) = (64, 8);
+        let (indptr, indices, values, labels) = synthetic_csr(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_csr(&indptr, &indices, &values, Some(num_cols)).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        let (owned, _shape) = bst.predict_from_csr(&indptr, &indices, &values, num_cols).unwrap();
+
+        let mut out = Vec::new();
+        bst.predict_from_csr_into(&indptr, &indices, &values, num_cols, &mut out)
+            .unwrap();
+        assert_eq!(out, owned);
+
+        // CSR prefix (first half of the rows) into the same buffer.
+        let half_rows = num_rows / 2;
+        let nnz_half = indptr[half_rows] as usize;
+        let cap_before = out.capacity();
+        bst.predict_from_csr_into(
+            &indptr[..=half_rows],
+            &indices[..nnz_half],
+            &values[..nnz_half],
+            num_cols,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out.len(), half_rows);
+        assert_eq!(out.capacity(), cap_before, "buffer must be reused, not reallocated");
+        assert_eq!(out[..], owned[..half_rows], "row predictions are independent of batch size");
     }
 
     #[test]

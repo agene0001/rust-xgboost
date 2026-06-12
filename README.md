@@ -15,9 +15,10 @@ Creates a shared library and uses Ninja instead of makefiles as generator.
 
 ## Requirements
 
-It is highly recommended to use the `use_prebuilt_xgb` feature, which is enabled by default.
-It will use an already compiled xgboost library which will be downloaded as build step of this crate.
-On Mac, it will use an arm64 shared library. On windows and linux, it is using x64 architecture.
+By default the crate builds XGBoost from the pinned submodule (`local_build` feature), so the
+headers used for bindgen and the runtime library can never disagree. This requires `cmake`
+(and uses `ninja` when available). Alternatively, the `use_prebuilt_xgb` feature downloads an
+already compiled library: `--no-default-features --features use_prebuilt_xgb`.
 
 On mac you need to install `libomp` (`brew install libomp`). 
 On debian, you need `libclang-dev` (`apt install -y libclang-dev`)
@@ -95,14 +96,43 @@ fn main() {
 See the [examples](https://github.com/agene0001/rust-xgboost/tree/master/examples) directory for
 more detailed examples of different features.
 
+## Performance
+
+For latency-sensitive serving of small batches (roughly under 1000 rows):
+
+* Pin the booster to one thread after loading: `booster.set_param("nthread", "1")`.
+  Small-batch latency is dominated by OpenMP thread dispatch; on a 127-feature/50-tree
+  binary model this measures ~11-20x faster for single rows.
+* Predict straight off your `&[f32]`/CSR slices with `predict_from_dense` /
+  `predict_from_csr` (inplace prediction) instead of building a `DMatrix` per request.
+* Reuse one output buffer across requests with `predict_from_dense_into` /
+  `predict_from_csr_into`. The warm serving loop then performs zero heap allocations
+  in the wrapper (verified by `tests/zero_alloc.rs`).
+
+For training and large-batch throughput, two opt-in flags tune the `local_build`
+C++ compilation (off by default to keep binaries portable):
+
+```sh
+XGB_BUILD_NATIVE=1  # tune codegen for the build machine (-march/-mcpu=native)
+XGB_BUILD_IPO=1     # link-time optimization for libxgboost
+```
+
+These only apply when building from source and the binary runs on the machine
+(or identical CPUs) it was built on. Expect the largest gains from
+`XGB_BUILD_NATIVE` on x86-64 hosts with AVX2/AVX-512.
+
+For large training sets with the `hist` tree method, prefer
+`DMatrix::from_dense_quantile` / `from_csr_quantile`, which store pre-binned data
+(~1 byte per value instead of 4) and skip a separate sketching pass.
+
 ## Status
 
-The version number is just an indicator that xboost 3.0.0 is used.
+The version number tracks the bundled XGBoost version.
 
 This is still a very early stage of development, so the API is changing as usability issues occur,
 or new features are supported. This is still expected to be compatible to an earlier rust-xgboost library.
 
-Builds against XGBoost 3.0.0.
+Builds against XGBoost 3.2.0.
 
 ## Use prebuilt xgboost library or build it
 

@@ -258,6 +258,105 @@ fn bench_per_round_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+/// Latency-sensitive serving path: booster pinned to `nthread=1` (the
+/// configuration the README recommends below ~1000 rows), small batches.
+/// Single-threaded prediction is stable enough to resolve per-call FFI
+/// overhead (allocations, JSON building) that OpenMP dispatch noise hides
+/// in the default-thread groups above.
+fn bench_serving_single_thread(c: &mut Criterion) {
+    let dtrain = DMatrix::load(TRAIN).unwrap();
+    let dtest = DMatrix::load(TEST).unwrap();
+    let num_features = dtrain.num_cols();
+    let mut booster = trained_booster(&dtrain, &dtest, 50);
+    booster.set_param("nthread", "1").unwrap();
+
+    let mut group = c.benchmark_group("serving_nthread1");
+    group.measurement_time(std::time::Duration::from_secs(6));
+
+    for num_rows in [1usize, 16, 100] {
+        let mut seed: u64 = 2024;
+        let data: Vec<f32> = (0..num_rows * num_features)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed as f64 / u64::MAX as f64) as f32
+            })
+            .collect();
+
+        // CSR version of the same shape, ~40% dense.
+        let mut indptr = vec![0u64];
+        let mut indices = Vec::new();
+        let mut values = Vec::new();
+        let mut nnz = 0u64;
+        for _ in 0..num_rows {
+            for j in 0..num_features {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed % 10 < 4 {
+                    indices.push(j as u64);
+                    values.push((seed % 1000) as f32 / 1000.0);
+                    nnz += 1;
+                }
+            }
+            indptr.push(nnz);
+        }
+
+        let label = format!("{}rows", num_rows);
+
+        group.bench_with_input(BenchmarkId::new("predict_from_dense", &label), &data, |b, data| {
+            b.iter(|| black_box(booster.predict_from_dense(black_box(data), num_rows).unwrap()));
+        });
+
+        // Steady-state buffer reuse: one output Vec kept across iterations.
+        group.bench_with_input(
+            BenchmarkId::new("predict_from_dense_into", &label),
+            &data,
+            |b, data| {
+                let mut out = Vec::new();
+                b.iter(|| {
+                    booster
+                        .predict_from_dense_into(black_box(data), num_rows, &mut out)
+                        .unwrap();
+                    black_box(&out);
+                });
+            },
+        );
+
+        let csr = (indptr, indices, values);
+        group.bench_with_input(
+            BenchmarkId::new("predict_from_csr", &label),
+            &csr,
+            |b, (ip, ix, v)| {
+                b.iter(|| {
+                    black_box(
+                        booster
+                            .predict_from_csr(black_box(ip), black_box(ix), black_box(v), num_features)
+                            .unwrap(),
+                    )
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("predict_from_csr_into", &label),
+            &csr,
+            |b, (ip, ix, v)| {
+                let mut out = Vec::new();
+                b.iter(|| {
+                    booster
+                        .predict_from_csr_into(black_box(ip), black_box(ix), black_box(v), num_features, &mut out)
+                        .unwrap();
+                    black_box(&out);
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_predict_entry_points,
@@ -265,6 +364,7 @@ criterion_group!(
     bench_inplace_predict,
     bench_inplace_predict_csr,
     bench_serialize,
-    bench_per_round_overhead
+    bench_per_round_overhead,
+    bench_serving_single_thread
 );
 criterion_main!(benches);
