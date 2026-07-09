@@ -93,7 +93,13 @@ impl BoosterParameters {
         v.extend(self.booster_type.as_string_pairs());
         v.extend(self.learning_params.as_string_pairs());
 
-        v.push(("silent".to_owned(), (!self.verbose as u8).to_string()));
+        // `silent` was removed as a learner parameter in XGBoost 1.0 and is
+        // silently ignored by 3.x; `verbosity` (0=silent, 1=warning, 2=info,
+        // 3=debug) is the working equivalent.
+        v.push((
+            "verbosity".to_owned(),
+            if self.verbose { "2" } else { "0" }.to_owned(),
+        ));
 
         if let Some(nthread) = self.threads {
             v.push(("nthread".to_owned(), nthread.to_string()));
@@ -264,10 +270,6 @@ impl<T: PartialOrd + Display> Interval<T> {
             max,
             max_inclusion,
         }
-    }
-
-    fn new_open_open(min: T, max: T) -> Self {
-        Interval::new(min, Inclusion::Open, max, Inclusion::Open)
     }
 
     fn new_open_closed(min: T, max: T) -> Self {

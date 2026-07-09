@@ -22,18 +22,9 @@ pub enum Objective {
     /// Logistic regression for binary classification, outputs scores before logistic transformation.
     BinaryLogisticRaw,
 
-    /// GPU version of [`RegLinear`](#variant.RegLinear).
-    GpuRegLinear,
-
-    /// GPU version of [`RegLogistic`](#variant.RegLogistic).
-    GpuRegLogistic,
-
-    /// GPU version of [`RegBinaryLogistic`](#variant.RegBinaryLogistic).
-    GpuBinaryLogistic,
-
-    /// GPU version of [`RegBinaryLogisticRaw`](#variant.RegBinaryLogisticRaw).
-    GpuBinaryLogisticRaw,
-
+    // The `gpu:*` objective variants were removed: the prefix was dropped in
+    // XGBoost 1.0 and 3.x rejects those names outright ("Unknown objective
+    // function"). GPU training is selected via the `device` parameter instead.
     /// Poisson regression for count data, outputs mean of poisson distribution.
     CountPoisson,
 
@@ -85,10 +76,6 @@ impl std::fmt::Display for Objective {
             Objective::RegLogistic => "reg:logistic".to_owned(),
             Objective::BinaryLogistic => "binary:logistic".to_owned(),
             Objective::BinaryLogisticRaw => "binary:logitraw".to_owned(),
-            Objective::GpuRegLinear => "gpu:reg:squarederror".to_owned(),
-            Objective::GpuRegLogistic => "gpu:reg:logistic".to_owned(),
-            Objective::GpuBinaryLogistic => "gpu:binary:logistic".to_owned(),
-            Objective::GpuBinaryLogisticRaw => "gpu:binary:logitraw".to_owned(),
             Objective::CountPoisson => "count:poisson".to_owned(),
             Objective::SurvivalCox => "survival:cox".to_owned(),
             Objective::MultiSoftmax(_) => "multi:softmax".to_owned(), // num_class conf must also be set
@@ -180,8 +167,14 @@ pub enum EvaluationMetric {
     /// Residual deviance for Gamma regression.
     GammaDeviance,
 
-    /// Negative log likelihood for Tweedie regression (at a specified value of the tweedie_variance_power parameter).
-    TweedieLogLoss,
+    /// Negative log likelihood for Tweedie regression, at the given value of
+    /// the variance power `rho`.
+    ///
+    /// XGBoost requires the metric in `tweedie-nloglik@rho` form (the bare name
+    /// is rejected with "must be in format tweedie-nloglik@rho"); `rho` must be
+    /// in the range [1, 2) and would typically match the objective's
+    /// `tweedie_variance_power`.
+    TweedieLogLoss(f32),
 }
 
 impl std::fmt::Display for EvaluationMetric {
@@ -207,7 +200,7 @@ impl std::fmt::Display for EvaluationMetric {
             EvaluationMetric::GammaLogLoss => "gamma-nloglik".to_owned(),
             EvaluationMetric::CoxLogLoss => "cox-nloglik".to_owned(),
             EvaluationMetric::GammaDeviance => "gamma-deviance".to_owned(),
-            EvaluationMetric::TweedieLogLoss => "tweedie-nloglik".to_owned(),
+            EvaluationMetric::TweedieLogLoss(rho) => format!("tweedie-nloglik@{}", rho),
         };
         write!(f, "{}", result)
     }
@@ -228,8 +221,12 @@ pub struct LearningTaskParameters {
 
     /// Initial prediction score, i.e. global bias.
     ///
-    /// *default*: 0.5
-    base_score: f32,
+    /// *default*: `None` — the parameter is not sent to XGBoost, which then
+    /// estimates the intercept from the training data (`boost_from_average`,
+    /// the XGBoost 2.0+/Python default). Setting an explicit value disables
+    /// that estimation, matching pre-2.0 behaviour (where the default was 0.5).
+    #[builder(setter(strip_option))]
+    base_score: Option<f32>,
 
     /// Metrics to use on evaluation data sets during training.
     ///
@@ -246,7 +243,7 @@ impl Default for LearningTaskParameters {
     fn default() -> Self {
         LearningTaskParameters {
             objective: Objective::default(),
-            base_score: 0.5,
+            base_score: None,
             eval_metrics: Metrics::Auto,
             seed: 0,
         }
@@ -262,12 +259,12 @@ impl LearningTaskParameters {
         self.objective = objective.into();
     }
 
-    pub fn base_score(&self) -> f32 {
+    pub fn base_score(&self) -> Option<f32> {
         self.base_score
     }
 
-    pub fn set_base_score(&mut self, base_score: f32) {
-        self.base_score = base_score;
+    pub fn set_base_score<T: Into<Option<f32>>>(&mut self, base_score: T) {
+        self.base_score = base_score.into();
     }
 
     pub fn eval_metrics(&self) -> &Metrics {
@@ -298,7 +295,11 @@ impl LearningTaskParameters {
         }
 
         v.push(("objective".to_owned(), self.objective.to_string()));
-        v.push(("base_score".to_owned(), self.base_score.to_string()));
+        // Only sent when explicitly set: passing base_score disables XGBoost
+        // 3.x's automatic intercept estimation (boost_from_average).
+        if let Some(base_score) = self.base_score {
+            v.push(("base_score".to_owned(), base_score.to_string()));
+        }
         v.push(("seed".to_owned(), self.seed.to_string()));
 
         if let Metrics::Custom(eval_metrics) = &self.eval_metrics {

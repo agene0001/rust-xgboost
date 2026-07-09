@@ -28,13 +28,10 @@ pub enum TreeMethod {
 
     /// Fast histogram optimized approximate greedy algorithm. It uses some performance improvements
     /// such as bins caching.
+    ///
+    /// For GPU training combine with `device=cuda` — XGBoost 2.0 removed the
+    /// `gpu_hist`/`gpu_exact` tree methods in favour of the `device` parameter.
     Hist,
-
-    /// GPU implementation of exact algorithm.
-    GpuExact,
-
-    /// GPU implementation of hist algorithm.
-    GpuHist,
 }
 
 impl std::fmt::Display for TreeMethod {
@@ -44,8 +41,6 @@ impl std::fmt::Display for TreeMethod {
             TreeMethod::Exact => "exact".to_owned(),
             TreeMethod::Approx => "approx".to_owned(),
             TreeMethod::Hist => "hist".to_owned(),
-            TreeMethod::GpuExact => "gpu_exact".to_owned(),
-            TreeMethod::GpuHist => "gpu_hist".to_owned(),
         };
         write!(f, "{}", result)
     }
@@ -65,8 +60,11 @@ impl<'a> From<&'a str> for TreeMethod {
             "exact" => TreeMethod::Exact,
             "approx" => TreeMethod::Approx,
             "hist" => TreeMethod::Hist,
-            "gpu_exact" => TreeMethod::GpuExact,
-            "gpu_hist" => TreeMethod::GpuHist,
+            // Compat shim: XGBoost 2.0 removed the gpu_* tree methods (GPU
+            // selection moved to the `device` parameter); map to the CPU
+            // spellings rather than emitting strings XGBoost 3.x rejects.
+            "gpu_exact" => TreeMethod::Exact,
+            "gpu_hist" => TreeMethod::Hist,
             _ => panic!("no known tree_method for {}", s),
         }
     }
@@ -79,17 +77,11 @@ pub enum TreeUpdater {
     /// Non-distributed column-based construction of trees.
     GrowColMaker,
 
-    /// Distributed tree construction with column-based data splitting mode.
-    DistCol,
-
     /// Distributed tree construction with row-based data splitting based on global proposal of histogram counting.
     GrowHistMaker,
 
-    /// Based on local histogram counting.
-    GrowLocalHistMaker,
-
-    /// Uses the approximate sketching algorithm.
-    GrowSkMaker,
+    /// Grow tree with the quantile histogram method (the `hist` tree method's updater).
+    GrowQuantileHistMaker,
 
     /// Synchronizes trees in all distributed nodes.
     Sync,
@@ -106,10 +98,8 @@ impl std::fmt::Display for TreeUpdater {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let result = match *self {
             TreeUpdater::GrowColMaker => "grow_colmaker".to_owned(),
-            TreeUpdater::DistCol => "distcol".to_owned(),
             TreeUpdater::GrowHistMaker => "grow_histmaker".to_owned(),
-            TreeUpdater::GrowLocalHistMaker => "grow_local_histmaker".to_owned(),
-            TreeUpdater::GrowSkMaker => "grow_skmaker".to_owned(),
+            TreeUpdater::GrowQuantileHistMaker => "grow_quantile_histmaker".to_owned(),
             TreeUpdater::Sync => "sync".to_owned(),
             TreeUpdater::Refresh => "refresh".to_owned(),
             TreeUpdater::Prune => "prune".to_owned(),
@@ -165,26 +155,11 @@ impl std::fmt::Display for GrowPolicy {
     }
 }
 
-/// The type of predictor algorithm to use. Provides the same results but allows the use of GPU or CPU.
-#[derive(Clone, Default)]
-pub enum Predictor {
-    /// Multicore CPU prediction algorithm.
-    #[default]
-    Cpu,
-
-    /// Prediction using GPU. Default for ‘gpu_exact’ and ‘gpu_hist’ tree method.
-    Gpu,
-}
-
-impl std::fmt::Display for Predictor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let result = match *self {
-            Predictor::Cpu => "cpu_predictor".to_owned(),
-            Predictor::Gpu => "gpu_predictor".to_owned(),
-        };
-        write!(f, "{}", result)
-    }
-}
+// Note: the `predictor` parameter (cpu_predictor/gpu_predictor) and
+// `sketch_eps` were removed from XGBoost (2.0 and 1.7 respectively) and are
+// silently ignored by 3.x, so this wrapper no longer exposes or emits them.
+// Predictor/device selection is via the `device` parameter; sketch granularity
+// is controlled by `max_bin`.
 
 /// BoosterParameters for Tree Booster. Create using
 /// [`TreeBoosterParametersBuilder`](struct.TreeBoosterParametersBuilder.html).
@@ -273,15 +248,6 @@ pub struct TreeBoosterParameters {
     #[builder(default = "TreeMethod::default()")]
     tree_method: TreeMethod,
 
-    /// This is only used for approximate greedy algorithm.
-    /// This roughly translated into O(1 / sketch_eps) number of bins. Compared to directly select number of bins,
-    /// this comes with theoretical guarantee with sketch accuracy.
-    /// Usually user does not have to tune this. but consider setting to a lower number for more accurate enumeration.
-    ///
-    /// * range: (0.0, 1.0)
-    /// * default: 0.03
-    sketch_eps: f32,
-
     /// Control the balance of positive and negative weights, useful for unbalanced classes.
     /// A typical value to consider: sum(negative cases) / sum(positive cases).
     ///
@@ -324,11 +290,6 @@ pub struct TreeBoosterParameters {
     ///
     /// * default: 1
     num_parallel_tree: u32,
-
-    /// The type of predictor algorithm to use. Provides the same results but allows the use of GPU or CPU.
-    ///
-    /// * default: [`Predictor::Cpu`](enum.Predictor.html#variant.Cpu)
-    predictor: Predictor,
 }
 
 impl Default for TreeBoosterParameters {
@@ -346,7 +307,6 @@ impl Default for TreeBoosterParameters {
             lambda: 1.0,
             alpha: 0.0,
             tree_method: TreeMethod::default(),
-            sketch_eps: 0.03,
             scale_pos_weight: 1.0,
             updater: Vec::new(),
             refresh_leaf: true,
@@ -355,7 +315,6 @@ impl Default for TreeBoosterParameters {
             max_leaves: 0,
             max_bin: 256,
             num_parallel_tree: 1,
-            predictor: Predictor::default(),
         }
     }
 }
@@ -376,7 +335,6 @@ impl TreeBoosterParameters {
             ("lambda".to_owned(), self.lambda.to_string()),
             ("alpha".to_owned(), self.alpha.to_string()),
             ("tree_method".to_owned(), self.tree_method.to_string()),
-            ("sketch_eps".to_owned(), self.sketch_eps.to_string()),
             ("scale_pos_weight".to_owned(), self.scale_pos_weight.to_string()),
             ("refresh_leaf".to_owned(), (self.refresh_leaf as u8).to_string()),
             ("process_type".to_owned(), self.process_type.to_string()),
@@ -384,7 +342,6 @@ impl TreeBoosterParameters {
             ("max_leaves".to_owned(), self.max_leaves.to_string()),
             ("max_bin".to_owned(), self.max_bin.to_string()),
             ("num_parallel_tree".to_owned(), self.num_parallel_tree.to_string()),
-            ("predictor".to_owned(), self.predictor.to_string()),
         ];
 
         // Don't pass anything to XGBoost if the user didn't specify anything.
@@ -413,7 +370,6 @@ impl TreeBoosterParametersBuilder {
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bytree, "colsample_bytree")?;
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bylevel, "colsample_bylevel")?;
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bynode, "colsample_bynode")?;
-        Interval::new_open_open(0.0, 1.0).validate(&self.sketch_eps, "sketch_eps")?;
         Ok(())
     }
 }
