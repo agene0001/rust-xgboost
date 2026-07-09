@@ -202,3 +202,46 @@ fn inplace_csr_predict_into_is_allocation_free_when_warm() {
     assert_eq!(out, expected, "warm calls must keep producing identical predictions");
     assert_eq!(allocs, 0, "predict_from_csr_into must not allocate once warm");
 }
+
+#[test]
+fn custom_objective_round_allocates_only_objective_outputs() {
+    // `boost()` builds the gradient/hessian array-interface JSON on the stack
+    // (see `write_interface_{1d,2d}` in booster.rs), so the only per-round Rust
+    // allocations left in `update_custom` are the two Vecs the objective itself
+    // returns. Pin that count exactly: a regression back to heap-built JSON
+    // (previously 4+ allocations per round — two `format!` Strings plus two
+    // `CString`s) fails this assertion.
+    fn logistic_obj(preds: &[f32], dtrain: &DMatrix) -> (Vec<f32>, Vec<f32>) {
+        let labels = dtrain.get_labels().unwrap();
+        let mut grad = Vec::with_capacity(preds.len());
+        let mut hess = Vec::with_capacity(preds.len());
+        for (&p, &y) in preds.iter().zip(labels) {
+            grad.push(p - y);
+            hess.push(p * (1.0 - p));
+        }
+        (grad, hess)
+    }
+
+    let (num_rows, num_cols) = (128, 16);
+    let (data, labels) = synthetic_dense(num_rows, num_cols);
+    let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+    dm.set_labels(&labels).unwrap();
+    let mut bst = trained_booster(&dm);
+    bst.set_param("nthread", "1").unwrap();
+
+    // Warm up one custom round (fills XGBoost's internal prediction caches).
+    bst.update_custom(&dm, 10, logistic_obj).unwrap();
+
+    const ROUNDS: i32 = 10;
+    let allocs = count_own_allocations(|| {
+        for i in 0..ROUNDS {
+            bst.update_custom(&dm, 11 + i, logistic_obj).unwrap();
+        }
+    });
+
+    assert_eq!(
+        allocs,
+        2 * ROUNDS as usize,
+        "update_custom must allocate only the objective's grad/hess Vecs per round"
+    );
+}

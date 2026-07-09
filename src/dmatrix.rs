@@ -225,6 +225,17 @@ impl DMatrix {
         // missing value in both paths, matching historical behavior.
         const PARALLEL_THRESHOLD: usize = 50_000;
 
+        // Guard the shape inference: without this, num_rows = 0 dies on a bare
+        // integer division panic, and a non-divisible length silently drops the
+        // trailing values and builds a wrong-shaped matrix.
+        if num_rows == 0 || !data.len().is_multiple_of(num_rows) {
+            return Err(XGBError::new(format!(
+                "data length {} does not divide into num_rows {}",
+                data.len(),
+                num_rows
+            )));
+        }
+
         let mut handle = ptr::null_mut();
         let num_cols = (data.len() / num_rows) as xgboost_sys::bst_ulong;
 
@@ -266,6 +277,14 @@ impl DMatrix {
     pub fn from_dense_quantile(data: &[f32], num_rows: usize, labels: Option<&[f32]>, max_bin: u32) -> XGBResult<Self> {
         if let Some(l) = labels {
             assert_eq!(l.len(), num_rows, "labels length must equal num_rows");
+        }
+        // Same shape guard as `from_dense`.
+        if num_rows == 0 || !data.len().is_multiple_of(num_rows) {
+            return Err(XGBError::new(format!(
+                "data length {} does not divide into num_rows {}",
+                data.len(),
+                num_rows
+            )));
         }
         let num_cols = data.len() / num_rows;
         let ptr = data.as_ptr() as usize;
@@ -518,6 +537,15 @@ impl DMatrix {
     /// Get a new DMatrix as a containing only given indices.
     pub fn slice(&self, indices: &[usize]) -> XGBResult<DMatrix> {
         debug!("Slicing {} rows from DMatrix", indices.len());
+        // XGDMatrixSliceDMatrix does not bounds-check: an out-of-range index
+        // reads outside the row array and can segfault. Validate here (also
+        // covers the i32 cast below overflowing).
+        if let Some(&bad) = indices.iter().find(|&&i| i >= self.num_rows) {
+            return Err(XGBError::new(format!(
+                "slice index {} out of bounds for DMatrix with {} rows",
+                bad, self.num_rows
+            )));
+        }
         let mut out_handle = ptr::null_mut();
         let indices: Vec<i32> = indices.iter().map(|x| *x as i32).collect();
         xgb_call!(xgboost_sys::XGDMatrixSliceDMatrix(
@@ -798,6 +826,15 @@ mod tests {
     }
 
     #[test]
+    fn from_dense_rejects_bad_shape() {
+        // Length not divisible by num_rows: must error, not silently truncate.
+        assert!(DMatrix::from_dense(&[1.0, 2.0, 3.0], 2).is_err());
+        // Zero rows: must error, not panic on division by zero.
+        assert!(DMatrix::from_dense(&[1.0], 0).is_err());
+        assert!(DMatrix::from_dense_quantile(&[1.0, 2.0, 3.0], 2, None, 256).is_err());
+    }
+
+    #[test]
     fn slice_from_indices() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let num_rows = 4;
@@ -809,8 +846,10 @@ mod tests {
         assert_eq!(dmat.slice(&[1]).unwrap().shape(), (1, 2));
         assert_eq!(dmat.slice(&[0, 1]).unwrap().shape(), (2, 2));
         assert_eq!(dmat.slice(&[3, 2, 1]).unwrap().shape(), (3, 2));
-        // slicing out of bounds is not safe and can cause a segfault
-        // assert_eq!(dmat.slice(&[10, 11, 12]).unwrap().shape(), (3, 2));
+        // Out-of-bounds indices are rejected before reaching the C API, which
+        // does not bounds-check and can segfault on them.
+        assert!(dmat.slice(&[10, 11, 12]).is_err());
+        assert!(dmat.slice(&[0, 4]).is_err());
     }
 
     #[test]

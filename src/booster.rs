@@ -15,29 +15,13 @@ use crate::parameters::{BoosterParameters, CallbackEnv, TrainingParameters};
 
 pub type CustomObjective = fn(&[f32], &DMatrix) -> (Vec<f32>, Vec<f32>);
 
-/// Creates a JSON-encoded array interface string for use with XGBoost C API.
-/// This follows the NumPy array interface specification.
-fn make_array_interface(data: &[f32], num_rows: usize, n_targets: usize) -> String {
-    let ptr = data.as_ptr() as usize;
-    // Format: {"data": [ptr, read_only], "shape": [...], "typestr": "<f4", "version": 3}
-    // "<f4" means little-endian 4-byte float (f32).
-    //
-    // For multi-target boosters (num_target > 1, e.g. distributional models
-    // training mu/sigma in one booster) XGBoost requires the gradient/hessian
-    // to be declared as a 2D `[num_row, n_targets]` array. Passing a 1D
-    // `[len]` (where len = num_row * n_targets) trips the C-side check
-    // `i_grad.Shape<0>() == p_fmat->Info().num_row_` in XGBoosterTrainOneIter
-    // because Shape<0> becomes num_row * n_targets instead of num_row.
-    let shape = if n_targets > 1 {
-        format!("[{},{}]", num_rows, n_targets)
-    } else {
-        format!("[{}]", data.len())
-    };
-    format!(
-        r#"{{"data":[{},false],"shape":{},"strides":null,"typestr":"<f4","version":3}}"#,
-        ptr, shape
-    )
-}
+// The gradient/hessian array interface for `XGBoosterTrainOneIter` is built on
+// the stack in `boost` via `write_interface_{1d,2d}` (see that call site). For
+// multi-target boosters (num_target > 1, e.g. distributional models training
+// mu/sigma in one booster) XGBoost requires the gradient/hessian to be declared
+// as a 2D `[num_row, n_targets]` array. Passing a 1D `[len]` (where len =
+// num_row * n_targets) trips the C-side check `i_grad.Shape<0>() ==
+// p_fmat->Info().num_row_` because Shape<0> becomes num_row * n_targets.
 
 #[derive(Default, Debug, Clone)]
 pub enum PredictType {
@@ -90,10 +74,14 @@ mod predict_config {
     /// `missing` field; NaN matches the missing value used by `DMatrix`.
     pub const NORMAL_INPLACE: &CStr =
         cr#"{"type":0,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"missing":NaN}"#;
-    /// Output margin (type 1). The `training: true` flag is preserved from the
-    /// legacy `XGBoosterPredict` call this replaces.
+    /// Output margin (type 1). `training: false`: this backs the public
+    /// `predict_margin` inference API and the custom-eval path, matching
+    /// Python's `predict(output_margin=True)`. Only DART models are sensitive
+    /// to the flag — the legacy call this replaced passed `training=1`, which
+    /// applied random tree-dropout per call and made DART margins
+    /// nondeterministic.
     pub const MARGIN: &CStr =
-        cr#"{"type":1,"training":true,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
+        cr#"{"type":1,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
     /// SHAP feature contributions (type 2).
     pub const CONTRIBUTIONS: &CStr =
         cr#"{"type":2,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false}"#;
@@ -173,6 +161,33 @@ fn write_interface_2d(buf: &mut CBuf<ARRAY_INTERFACE_BUF>, ptr: usize, rows: usi
     )
     .expect("array-interface JSON exceeds stack buffer");
     buf.as_cstr()
+}
+
+/// Assemble the borrowed (data, shape) output of an `XGBoosterPredict*` call.
+///
+/// XGBoost hands back a null data pointer when the prediction is empty (e.g. a
+/// 0-row DMatrix); that must become an empty slice rather than either a panic
+/// or a `slice::from_raw_parts(null, 0)` call, which is UB even for length 0.
+/// A null pointer alongside a non-empty shape would be a C-API contract
+/// violation and still asserts. The unconstrained return lifetime is bound by
+/// each caller's signature to the booster owning the buffers.
+fn predict_output_slices<'a>(
+    out_shape: *const u64,
+    out_shape_dim: xgboost_sys::bst_ulong,
+    out_result: *const f32,
+) -> (&'a [f32], &'a [u64]) {
+    let shape: &[u64] = if out_shape.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) }
+    };
+    let data_size: u64 = shape.iter().product();
+    if out_result.is_null() {
+        assert_eq!(data_size, 0, "XGBoost returned null predictions for a non-empty shape");
+        (&[], shape)
+    } else {
+        (unsafe { slice::from_raw_parts(out_result, data_size as usize) }, shape)
+    }
 }
 
 /// Core model in XGBoost, containing functions for training, evaluating and predicting.
@@ -263,12 +278,19 @@ impl Booster {
     /// Format is "ubj" when binary, otherwise "json"
     pub fn save_buffer(&self, binary: bool) -> XGBResult<Vec<u8>> {
         trace!("Writing Booster to buffer");
-        let config = format!("{{\"format\":\"{}\"}}", if binary { "ubj" } else { "json" });
+        // Static NUL-terminated configs: XGBoosterSaveModelToBuffer expects a C
+        // string. The previous format!-built String passed its pointer without
+        // a NUL terminator, so the C side read past the end of the allocation.
+        let config: &ffi::CStr = if binary {
+            cr#"{"format":"ubj"}"#
+        } else {
+            cr#"{"format":"json"}"#
+        };
         let mut out_len: xgboost_sys::bst_ulong = 0;
         let mut out_buffer = ptr::null();
         xgb_call!(xgboost_sys::XGBoosterSaveModelToBuffer(
             self.handle,
-            config.as_bytes().as_ptr() as *const raw::c_char,
+            config.as_ptr(),
             &mut out_len,
             &mut out_buffer
         ))?;
@@ -512,11 +534,28 @@ impl Booster {
             1
         };
 
-        let grad_interface = make_array_interface(gradient, num_rows, n_targets);
-        let hess_interface = make_array_interface(hessian, num_rows, n_targets);
-
-        let grad_cstr = ffi::CString::new(grad_interface).unwrap();
-        let hess_cstr = ffi::CString::new(hess_interface).unwrap();
+        // Build the gradient/hessian array-interface JSON on the stack, matching
+        // the allocation-free predict paths. `write_interface_{1d,2d}` produce
+        // byte-identical output to the old `make_array_interface`: a 1D `[len]`
+        // shape for single-target boosters, a 2D `[num_rows, n_targets]` shape
+        // for multi-target ones. Keeps the per-round custom-objective training
+        // hot path free of the four heap allocations `format!` + `CString::new`
+        // incurred here previously (see the `predict_config` module comment).
+        let mut grad_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let mut hess_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
+        let grad_ptr = gradient.as_ptr() as usize;
+        let hess_ptr = hessian.as_ptr() as usize;
+        let (grad_cstr, hess_cstr) = if n_targets > 1 {
+            (
+                write_interface_2d(&mut grad_buf, grad_ptr, num_rows, n_targets),
+                write_interface_2d(&mut hess_buf, hess_ptr, num_rows, n_targets),
+            )
+        } else {
+            (
+                write_interface_1d(&mut grad_buf, grad_ptr, gradient.len(), "<f4"),
+                write_interface_1d(&mut hess_buf, hess_ptr, hessian.len(), "<f4"),
+            )
+        };
 
         xgb_call!(xgboost_sys::XGBoosterTrainOneIter(
             self.handle,
@@ -765,11 +804,7 @@ impl Booster {
             &mut out_shape_dim,
             &mut out_result
         ))?;
-        assert!(!out_result.is_null());
-        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
-        let data_size: u64 = shape.iter().product();
-        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
-        Ok((data, shape))
+        Ok(predict_output_slices(out_shape, out_shape_dim, out_result))
     }
 
     /// Predict directly from a dense, row-major `[num_rows, num_cols]` slice
@@ -816,6 +851,16 @@ impl Booster {
     /// slices borrowed from booster-owned buffers (same validity contract as
     /// [`predict_raw`](Self::predict_raw): valid until the next prediction call).
     fn inplace_predict_dense_raw(&self, values: &[f32], num_rows: usize) -> XGBResult<(&[f32], &[u64])> {
+        // Guard the shape inference: without this, num_rows = 0 dies on a bare
+        // integer division panic, and a non-divisible length silently drops the
+        // trailing values and predicts on a wrong-shaped matrix.
+        if num_rows == 0 || !values.len().is_multiple_of(num_rows) {
+            return Err(XGBError::new(format!(
+                "values length {} does not divide into num_rows {}",
+                values.len(),
+                num_rows
+            )));
+        }
         let num_cols = values.len() / num_rows;
         let mut values_buf = CBuf::<ARRAY_INTERFACE_BUF>::new();
         let values_cstr = write_interface_2d(&mut values_buf, values.as_ptr() as usize, num_rows, num_cols);
@@ -832,11 +877,7 @@ impl Booster {
             &mut out_shape_dim,
             &mut out_result
         ))?;
-        assert!(!out_result.is_null());
-        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
-        let data_size: u64 = shape.iter().product();
-        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
-        Ok((data, shape))
+        Ok(predict_output_slices(out_shape, out_shape_dim, out_result))
     }
 
     /// Predict directly from a sparse CSR matrix without constructing a
@@ -916,11 +957,7 @@ impl Booster {
             &mut out_shape_dim,
             &mut out_result
         ))?;
-        assert!(!out_result.is_null());
-        let shape = unsafe { slice::from_raw_parts(out_shape, out_shape_dim as usize) };
-        let data_size: u64 = shape.iter().product();
-        let data = unsafe { slice::from_raw_parts(out_result, data_size as usize) };
-        Ok((data, shape))
+        Ok(predict_output_slices(out_shape, out_shape_dim, out_result))
     }
 
     /// Predict results for given data.
@@ -960,7 +997,8 @@ impl Booster {
     pub fn predict_leaf(&self, dmat: &DMatrix) -> XGBResult<(Vec<f32>, (usize, usize))> {
         let data = self.predict_raw(dmat, predict_config::LEAF)?.0.to_vec();
         let num_rows = dmat.num_rows();
-        let num_cols = data.len() / num_rows;
+        // 0-row matrices (e.g. from `slice(&[])`) must not panic on division.
+        let num_cols = data.len().checked_div(num_rows).unwrap_or(0);
         Ok((data, (num_rows, num_cols)))
     }
 
@@ -974,7 +1012,8 @@ impl Booster {
     pub fn predict_contributions(&self, dmat: &DMatrix) -> XGBResult<(Vec<f32>, (usize, usize))> {
         let data = self.predict_raw(dmat, predict_config::CONTRIBUTIONS)?.0.to_vec();
         let num_rows = dmat.num_rows();
-        let num_cols = data.len() / num_rows;
+        // 0-row matrices (e.g. from `slice(&[])`) must not panic on division.
+        let num_cols = data.len().checked_div(num_rows).unwrap_or(0);
         Ok((data, (num_rows, num_cols)))
     }
 
@@ -990,7 +1029,9 @@ impl Booster {
         let data = self.predict_raw(dmat, predict_config::INTERACTIONS)?.0.to_vec();
         let num_rows = dmat.num_rows();
 
-        let dim = ((data.len() / num_rows) as f64).sqrt() as usize;
+        // 0-row matrices (e.g. from `slice(&[])`) must not panic on division.
+        let per_row = data.len().checked_div(num_rows).unwrap_or(0);
+        let dim = (per_row as f64).sqrt() as usize;
         Ok((data, (num_rows, dim, dim)))
     }
 
@@ -1079,7 +1120,10 @@ impl Booster {
         debug!("Parsing evaluation line: {}", &eval);
         for part in eval.split('\t').skip(1) {
             for evname in evnames {
-                if part.starts_with(evname) {
+                // Entries are `<name>-<metric>:<score>`; requiring the `-`
+                // separator stops a name that is a prefix of another (e.g.
+                // "val" / "val2") from also matching the longer name's entries.
+                if part.starts_with(evname) && part[evname.len()..].starts_with('-') {
                     let metric_parts: Vec<&str> = part[evname.len() + 1..].split(':').collect();
                     assert_eq!(metric_parts.len(), 2);
                     let metric = metric_parts[0];
@@ -1322,6 +1366,9 @@ mod tests {
             .unwrap();
         let learning_params = learning::LearningTaskParametersBuilder::default()
             .objective(learning::Objective::BinaryLogistic)
+            // Pinned: the hardcoded expected values below were produced with a
+            // fixed 0.5 intercept (the pre-2.0 default), not the estimated one.
+            .base_score(0.5)
             .eval_metrics(learning::Metrics::Custom(vec![
                 learning::EvaluationMetric::MAPCutNegative(4),
                 learning::EvaluationMetric::LogLoss,
@@ -1407,6 +1454,9 @@ mod tests {
             .unwrap();
         let learning_params = learning::LearningTaskParametersBuilder::default()
             .objective(learning::Objective::BinaryLogistic)
+            // Pinned: the hardcoded expected values below were produced with a
+            // fixed 0.5 intercept (the pre-2.0 default), not the estimated one.
+            .base_score(0.5)
             .eval_metrics(learning::Metrics::Custom(vec![
                 learning::EvaluationMetric::MAPCutNegative(4),
                 learning::EvaluationMetric::LogLoss,
@@ -1520,6 +1570,19 @@ mod tests {
         let (_preds, shape) = booster.predict_leaf(&dmat_test).unwrap();
         let num_samples = dmat_test.num_rows();
         assert_eq!(shape, (num_samples, num_rounds as usize));
+
+        // 0-row matrices must not panic on the shape division; whether the C
+        // API returns Ok or Err for them is its business.
+        let empty = dmat_test.slice(&[]).unwrap();
+        if let Ok((_, shape)) = booster.predict_leaf(&empty) {
+            assert_eq!(shape.0, 0);
+        }
+        if let Ok((_, shape)) = booster.predict_contributions(&empty) {
+            assert_eq!(shape.0, 0);
+        }
+        if let Ok((_, shape)) = booster.predict_interactions(&empty) {
+            assert_eq!(shape.0, 0);
+        }
     }
 
     #[test]
@@ -1623,6 +1686,10 @@ mod tests {
             .unwrap();
         let learning_params = learning::LearningTaskParametersBuilder::default()
             .objective(learning::Objective::BinaryLogistic)
+            // Pinned so `update_custom_matches_builtin_objective` compares like
+            // with like: XGBoosterTrainOneIter (custom objective) never runs
+            // the automatic intercept estimation that UpdateOneIter does.
+            .base_score(0.5)
             .build()
             .unwrap();
         parameters::BoosterParametersBuilder::default()
@@ -1849,6 +1916,50 @@ mod tests {
     }
 
     #[test]
+    fn update_custom_matches_builtin_objective() {
+        // Exercises `boost()` — XGBoosterTrainOneIter with the stack-built
+        // gradient/hessian array interfaces — end to end: a hand-rolled
+        // binary-logistic objective must reproduce the built-in
+        // `binary:logistic` update on the same data.
+        fn logistic_obj(preds: &[f32], dtrain: &DMatrix) -> (Vec<f32>, Vec<f32>) {
+            let labels = dtrain.get_labels().unwrap();
+            let mut grad = Vec::with_capacity(preds.len());
+            let mut hess = Vec::with_capacity(preds.len());
+            for (&p, &y) in preds.iter().zip(labels) {
+                grad.push(p - y);
+                hess.push(p * (1.0 - p));
+            }
+            (grad, hess)
+        }
+
+        let (num_rows, num_cols) = (256, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+        let params = hist_binary_params(256);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+
+        let mut bst_builtin = Booster::new_with_cached_dmats(&params, &[&dm]).unwrap();
+        let mut bst_custom = Booster::new_with_cached_dmats(&params, &[&dm]).unwrap();
+        for i in 0..10 {
+            bst_builtin.update(&dm, i).unwrap();
+            bst_custom.update_custom(&dm, i, logistic_obj).unwrap();
+        }
+
+        let pred_builtin = bst_builtin.predict(&dm).unwrap();
+        let pred_custom = bst_custom.predict(&dm).unwrap();
+        assert_eq!(pred_builtin.len(), pred_custom.len());
+        for (a, b) in pred_builtin.iter().zip(&pred_custom) {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "custom objective diverged from builtin: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
     fn quantile_dmatrix_matches_dense_training() {
         let (num_rows, num_cols) = (512, 8);
         let (data, labels) = synthetic_dense(num_rows, num_cols);
@@ -1896,6 +2007,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_eval_string_prefix_names() {
+        // "val" is a prefix of "val2"; entries must not cross-match.
+        let s = "[0]\tval-logloss:1.0\tval2-logloss:0.5";
+        let metrics = Booster::parse_eval_string(s, &["val", "val2"]);
+        assert_eq!(metrics["val"].len(), 1);
+        assert_eq!(metrics["val"]["logloss"], 1.0);
+        assert_eq!(metrics["val2"].len(), 1);
+        assert_eq!(metrics["val2"]["logloss"], 0.5);
+    }
+
+    #[test]
+    fn predict_from_dense_rejects_bad_shape() {
+        let bst = load_test_booster();
+        // Length not divisible by num_rows: must error, not silently truncate.
+        assert!(bst.predict_from_dense(&[1.0, 2.0, 3.0], 2).is_err());
+        // Zero rows: must error, not panic on division by zero.
+        assert!(bst.predict_from_dense(&[1.0], 0).is_err());
+    }
+
+    #[test]
     fn dump_model() {
         let dmat_train =
             DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.train?format=libsvm"}"#).unwrap();
@@ -1909,6 +2040,9 @@ mod tests {
             .unwrap();
         let learning_params = learning::LearningTaskParametersBuilder::default()
             .objective(learning::Objective::BinaryLogistic)
+            // Pinned: the hardcoded model dump below was produced with a fixed
+            // 0.5 intercept (the pre-2.0 default), not the estimated one.
+            .base_score(0.5)
             .build()
             .unwrap();
         let booster_params = parameters::BoosterParametersBuilder::default()
