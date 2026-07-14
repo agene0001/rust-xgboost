@@ -11,6 +11,10 @@
 //!    `validate_features` runs on every custom-objective boosting round, relative
 //!    to the real work of a single boosting round (`update`)? This decides whether
 //!    hoisting/caching that check out of the training loop is worth the complexity.
+//!    Answered (M3 Pro, July 2026): ~37 ns for the getter vs ~2 ms for a round on
+//!    agaricus (0.002%), with no feature names set (the common case — the C++ side
+//!    then copies an empty vector). Even with names set it is microseconds. Do NOT
+//!    add a cache for this.
 //!
 //! Run with: cargo bench --bench predict_benchmark
 

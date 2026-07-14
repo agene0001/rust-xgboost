@@ -178,6 +178,14 @@ pub struct DMatrix {
     num_cols: usize,
 }
 
+// SAFETY: a `DMatrixHandle` has no thread affinity. As with `Booster` (see the
+// safety comment there), the C API keeps per-call scratch buffers in
+// thread-local storage keyed by the DMatrix pointer, so using or freeing the
+// handle from a different thread than the one that created it is fine. Kept
+// `!Sync`: XGBoost does not document the DMatrix getters/setters as safe for
+// concurrent use on one handle.
+unsafe impl Send for DMatrix {}
+
 impl DMatrix {
     /// Construct a new instance from a DMatrixHandle created by the XGBoost C API.
     fn new(handle: xgboost_sys::DMatrixHandle) -> XGBResult<Self> {

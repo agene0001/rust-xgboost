@@ -98,6 +98,9 @@ more detailed examples of different features.
 
 ## Performance
 
+See [docs/SERVING.md](docs/SERVING.md) for a complete guide to building and
+calling this crate for maximum performance. Summary:
+
 For latency-sensitive serving of small batches (roughly under 1000 rows):
 
 * Pin the booster to one thread after loading: `booster.set_param("nthread", "1")`.
@@ -106,8 +109,14 @@ For latency-sensitive serving of small batches (roughly under 1000 rows):
 * Predict straight off your `&[f32]`/CSR slices with `predict_from_dense` /
   `predict_from_csr` (inplace prediction) instead of building a `DMatrix` per request.
 * Reuse one output buffer across requests with `predict_from_dense_into` /
-  `predict_from_csr_into`. The warm serving loop then performs zero heap allocations
-  in the wrapper (verified by `tests/zero_alloc.rs`).
+  `predict_from_csr_into` (or `predict_into` when batch-scoring a `DMatrix`). The
+  warm serving loop then performs zero heap allocations in the wrapper (verified
+  by `tests/zero_alloc.rs`).
+* `Booster` and `DMatrix` are `Send`: load a model once and move it into a worker
+  thread, or keep one booster per thread in a pool. `Booster` is deliberately not
+  `Sync` — concurrent prediction on one instance would race on its cached
+  inplace-prediction proxy — so use per-thread instances (cheap to create with
+  `Booster::load_buffer`) rather than a shared reference.
 
 For training and large-batch throughput, two opt-in flags tune the `local_build`
 C++ compilation (off by default to keep binaries portable):

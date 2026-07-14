@@ -209,6 +209,19 @@ pub struct Booster {
     inplace_proxy: std::cell::OnceCell<xgboost_sys::DMatrixHandle>,
 }
 
+// SAFETY: a `BoosterHandle` has no thread affinity. All C-API return buffers
+// are stored in a *thread-local* map keyed by learner pointer
+// (`LearnerAPIThreadLocalStore` in src/learner.cc), so calls made from
+// different threads never share scratch state, and `~LearnerImpl` only erases
+// the destroying thread's entry — dropping on a different thread than the one
+// that created or used the booster is fine (this is how the Python bindings
+// use the C API, calling it from arbitrary threads with the GIL released).
+// The cached `inplace_proxy` DMatrix handle moves with the booster and is
+// only touched through `&self`/`&mut self`. `Booster` must stay `!Sync`:
+// concurrent `&self` inplace predictions would race on the shared proxy (the
+// `OnceCell` field enforces this automatically).
+unsafe impl Send for Booster {}
+
 impl Booster {
     /// Wrap a raw booster handle owned by this struct from now on.
     fn from_handle(handle: xgboost_sys::BoosterHandle) -> Self {
@@ -967,6 +980,21 @@ impl Booster {
         Ok(self.predict_borrowed(dmat)?.to_vec())
     }
 
+    /// Like [`predict`](Self::predict), but writes the predictions into `out`
+    /// (cleared first) instead of returning a fresh `Vec`.
+    ///
+    /// The DMatrix-path counterpart of
+    /// [`predict_from_dense_into`](Self::predict_from_dense_into): reusing one
+    /// buffer across calls makes a steady-state batch-scoring loop
+    /// allocation-free on the Rust side. The output length is
+    /// `num_rows * n_groups` (`n_groups` is 1 for regression/binary models).
+    pub fn predict_into(&self, dmat: &DMatrix, out: &mut Vec<f32>) -> XGBResult<()> {
+        let data = self.predict_borrowed(dmat)?;
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
     /// Predict results for given data, borrowing XGBoost's internal output buffer.
     ///
     /// The returned slice points into a buffer owned by this booster and is only
@@ -981,6 +1009,16 @@ impl Booster {
     /// Returns an array containing one entry per row in the given data.
     pub fn predict_margin(&self, dmat: &DMatrix) -> XGBResult<Vec<f32>> {
         Ok(self.predict_margin_borrowed(dmat)?.to_vec())
+    }
+
+    /// Like [`predict_margin`](Self::predict_margin), but writes the margins
+    /// into `out` (cleared first); see [`predict_into`](Self::predict_into)
+    /// for the buffer-reuse rationale.
+    pub fn predict_margin_into(&self, dmat: &DMatrix, out: &mut Vec<f32>) -> XGBResult<()> {
+        let data = self.predict_margin_borrowed(dmat)?;
+        out.clear();
+        out.extend_from_slice(data);
+        Ok(())
     }
 
     /// Margin prediction borrowing XGBoost's internal output buffer; same
@@ -1438,6 +1476,64 @@ mod tests {
             println!("predictions={}, expected={}", pred, expected);
             assert!(pred - expected < eps);
         }
+    }
+
+    #[test]
+    fn predict_into_matches_predict() {
+        let dmat_train =
+            DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.train?format=libsvm"}"#).unwrap();
+        let dmat_test =
+            DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.test?format=libsvm"}"#).unwrap();
+        let mut booster = Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&dmat_train]).unwrap();
+        for i in 0..5 {
+            booster.update(&dmat_train, i).unwrap();
+        }
+
+        let mut out = Vec::new();
+        booster.predict_into(&dmat_test, &mut out).unwrap();
+        assert_eq!(out, booster.predict(&dmat_test).unwrap());
+
+        // Reuse must clear stale contents from the previous call.
+        let single = dmat_test.slice(&[0]).unwrap();
+        booster.predict_into(&single, &mut out).unwrap();
+        assert_eq!(out.len(), 1);
+
+        booster.predict_margin_into(&dmat_test, &mut out).unwrap();
+        assert_eq!(out, booster.predict_margin(&dmat_test).unwrap());
+    }
+
+    /// `Booster` and `DMatrix` are `Send`: a model loaded on one thread can be
+    /// moved to (used on, and dropped on) another, the pattern serving thread
+    /// pools rely on. Predictions must be identical across threads.
+    #[test]
+    fn booster_and_dmatrix_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Booster>();
+        assert_send::<DMatrix>();
+
+        let dmat_train =
+            DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.train?format=libsvm"}"#).unwrap();
+        let dmat_test =
+            DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.test?format=libsvm"}"#).unwrap();
+        let mut booster = Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&dmat_train]).unwrap();
+        for i in 0..5 {
+            booster.update(&dmat_train, i).unwrap();
+        }
+        let expected = booster.predict(&dmat_test).unwrap();
+        // Exercise the inplace path on this thread first so the cached proxy
+        // DMatrix also crosses the thread boundary below.
+        let row = vec![0.0f32; dmat_test.num_cols()];
+        booster.predict_from_dense(&row, 1).unwrap();
+
+        let from_thread = std::thread::spawn(move || {
+            let preds = booster.predict(&dmat_test).unwrap();
+            booster.predict_from_dense(&row, 1).unwrap();
+            preds
+            // booster and dmat_test drop on this thread
+        })
+        .join()
+        .unwrap();
+        assert_eq!(expected, from_thread);
     }
 
     #[test]
