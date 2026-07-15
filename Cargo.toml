@@ -1,6 +1,6 @@
 [package]
 name = "xgb"
-version = "3.2.0"
+version = "3.3.0"
 authors = ["Dave Challis <dave@suicas.net>", "Marco Mengelkoch", "Felix Agene <agene001@umn.edu>"]
 license = "MIT"
 repository = "https://github.com/agene0001/rust-xgboost"
@@ -16,7 +16,7 @@ edition = "2024"
 # --no-default-features --features use_prebuilt_xgb, running both the binary
 # download AND the cmake source build. Feature selection must flow only
 # through this crate's feature list below.
-xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.2.0", default-features = false }
+xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.3.0", default-features = false }
 libc = "0.2.186"
 derive_builder = "0.20.2"
 log = "0.4.33"

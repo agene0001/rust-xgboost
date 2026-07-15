@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// pinned submodule by `.github/workflows/release-libs.yml` (flat asset names,
 /// `<target>-<file>`). Bump the tag here together with the submodule.
 #[cfg(feature = "use_prebuilt_xgb")]
-const PREBUILT_RELEASE_URL: &str = "https://github.com/agene0001/rust-xgboost/releases/download/v3.2.0";
+const PREBUILT_RELEASE_URL: &str = "https://github.com/agene0001/rust-xgboost/releases/download/v3.3.0";
 
 /// Fallback: XGBoost 3.0.0 binaries committed in the upstream fork's repo at its
 /// v3.0.1 tag. These are OLDER than the bundled headers (version skew), so a
@@ -89,6 +89,16 @@ fn main() {
     #[cfg(feature = "local_build")]
     {
         // compile XGBOOST with cmake (and ninja, when available)
+
+        // Rebuild the C++ when the bundled XGBoost version changes. Without
+        // this, checking out a new submodule tag silently reuses the previous
+        // version's cached libxgboost (cargo only reruns build scripts on
+        // watched-path changes). The version header changes on exactly every
+        // release bump, so it is a cheap, reliable proxy for "submodule moved".
+        println!(
+            "cargo:rerun-if-changed={}",
+            xgb_root.join("include/xgboost/version_config.h").display()
+        );
 
         // CMake
         let mut dst = cmake::Config::new(&xgb_root);

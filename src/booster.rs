@@ -1483,6 +1483,35 @@ mod tests {
         }
     }
 
+    /// XGBoost 3.3 deprecated `booster=dart` (remapped internally to gbtree
+    /// with dropout params) and `booster=gblinear` (removal planned). Both
+    /// must keep training and predicting until upstream actually removes
+    /// them; this failing on a future submodule bump means the wrapper's
+    /// `BoosterType` surface needs migrating, not just a re-pin.
+    #[test]
+    fn deprecated_booster_types_still_train() {
+        let dmat_train =
+            DMatrix::load(r#"{"uri": "xgboost-sys/xgboost/demo/data/agaricus.txt.train?format=libsvm"}"#).unwrap();
+
+        for booster_type in [
+            parameters::BoosterType::Dart(Default::default()),
+            parameters::BoosterType::Linear(Default::default()),
+        ] {
+            let params = parameters::BoosterParametersBuilder::default()
+                .booster_type(booster_type)
+                .verbose(false)
+                .build()
+                .unwrap();
+            let mut booster = Booster::new_with_cached_dmats(&params, &[&dmat_train]).unwrap();
+            for i in 0..3 {
+                booster.update(&dmat_train, i).expect("deprecated booster type failed to train");
+            }
+            let preds = booster.predict(&dmat_train).unwrap();
+            assert_eq!(preds.len(), dmat_train.num_rows());
+            assert!(preds.iter().all(|p| p.is_finite()));
+        }
+    }
+
     #[test]
     fn predict_into_matches_predict() {
         let dmat_train =
