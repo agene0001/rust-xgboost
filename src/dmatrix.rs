@@ -816,6 +816,33 @@ mod tests {
         assert_eq!(qdm.shape(), (num_rows, num_cols));
     }
 
+    /// Meta info (base_margin, weights) must be settable AFTER quantile
+    /// construction: only the feature data is frozen by the binning, not the
+    /// float-info fields. Distributional-regression callers rely on this to
+    /// inject start values as the base margin on a QuantileDMatrix.
+    #[test]
+    fn quantile_get_set_base_margin_and_weights() {
+        let num_rows = 50;
+        let num_cols = 4;
+        let mut data = vec![0f32; num_rows * num_cols];
+        for i in 0..num_rows {
+            for j in 0..num_cols {
+                data[i * num_cols + j] = ((i * 3 + j) % 17) as f32;
+            }
+        }
+        let mut qdm = DMatrix::from_dense_quantile(&data, num_rows, None, 64).unwrap();
+
+        assert!(qdm.get_base_margin().unwrap().is_empty());
+        // Multi-target-style margin: 2 values per row, flattened row-major.
+        let margin: Vec<f32> = (0..num_rows * 2).map(|i| i as f32 * 0.25).collect();
+        assert!(qdm.set_base_margin(&margin).is_ok());
+        assert_eq!(qdm.get_base_margin().unwrap(), &margin[..]);
+
+        let weights: Vec<f32> = (0..num_rows).map(|i| 1.0 + (i % 3) as f32).collect();
+        assert!(qdm.set_weights(&weights).is_ok());
+        assert_eq!(qdm.get_weights().unwrap(), &weights[..]);
+    }
+
     #[test]
     fn from_dense() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];

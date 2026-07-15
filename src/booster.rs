@@ -294,11 +294,7 @@ impl Booster {
         // Static NUL-terminated configs: XGBoosterSaveModelToBuffer expects a C
         // string. The previous format!-built String passed its pointer without
         // a NUL terminator, so the C side read past the end of the allocation.
-        let config: &ffi::CStr = if binary {
-            cr#"{"format":"ubj"}"#
-        } else {
-            cr#"{"format":"json"}"#
-        };
+        let config: &ffi::CStr = if binary { cr#"{"format":"ubj"}"# } else { cr#"{"format":"json"}"# };
         let mut out_len: xgboost_sys::bst_ulong = 0;
         let mut out_buffer = ptr::null();
         xgb_call!(xgboost_sys::XGBoosterSaveModelToBuffer(
@@ -519,12 +515,21 @@ impl Booster {
     /// Update this model by directly specifying the first and second order gradients.
     ///
     /// This is typically used instead of `update` when using a customised loss function.
+    /// Prefer it over [`update_custom`](Self::update_custom) when the caller already
+    /// has the gradients in hand (e.g. it carries the training margin across rounds
+    /// and computes grad/hess from it): `update_custom` predicts on `dtrain` before
+    /// invoking its callback, so a caller that ignores that prediction pays one
+    /// wasted prediction-cache read per round.
+    ///
+    /// For multi-target boosters (`num_target > 1`), `gradient`/`hessian` are
+    /// row-major `[num_rows, n_targets]` flattened; the target count is inferred
+    /// from `gradient.len() / dtrain.num_rows()`.
     ///
     /// * `dtrain` - matrix to train the model with for a single iteration
     /// * `iteration` - current iteration number
     /// * `gradient` - first order gradient
     /// * `hessian` - second order gradient
-    fn boost(&mut self, dtrain: &DMatrix, iteration: i32, gradient: &[f32], hessian: &[f32]) -> XGBResult<()> {
+    pub fn boost(&mut self, dtrain: &DMatrix, iteration: i32, gradient: &[f32], hessian: &[f32]) -> XGBResult<()> {
         if gradient.len() != hessian.len() {
             let msg = format!(
                 "Mismatch between length of gradient and hessian arrays ({} != {})",
@@ -1502,6 +1507,71 @@ mod tests {
         assert_eq!(out, booster.predict_margin(&dmat_test).unwrap());
     }
 
+    /// The distributional-regression training flow on a `QuantileDMatrix`:
+    /// multi-target booster, start values injected as a post-construction base
+    /// margin, custom gradients fed through the public `boost`, per-round
+    /// cached `predict`. Verifies (a) predict on a quantile matrix includes the
+    /// base margin (0-tree booster returns exactly margin + base_score), and
+    /// (b) `boost` + `predict` round-trips build a real multi-target model.
+    #[test]
+    fn quantile_dmatrix_base_margin_boost_multi_target() {
+        let num_rows = 60;
+        let num_cols = 5;
+        let n_targets = 2;
+        let mut data = vec![0f32; num_rows * num_cols];
+        let mut labels = vec![0f32; num_rows];
+        for i in 0..num_rows {
+            for j in 0..num_cols {
+                data[i * num_cols + j] = ((i * 7 + j * 3) % 13) as f32;
+            }
+            labels[i] = (i % 4) as f32;
+        }
+
+        let mut qdm = DMatrix::from_dense_quantile(&data, num_rows, Some(&labels), 256).unwrap();
+        // Row-major [num_rows, n_targets] margin, constant per target.
+        let margin: Vec<f32> = (0..num_rows).flat_map(|_| [0.5f32, -1.5f32]).collect();
+        qdm.set_base_margin(&margin).unwrap();
+
+        let mut booster = Booster::new_with_cached_dmats(&BoosterParameters::default(), &[&qdm]).unwrap();
+        booster.set_param("num_target", "2").unwrap();
+        booster.set_param("base_score", "0.0").unwrap();
+        booster.set_param("tree_method", "hist").unwrap();
+        booster.set_param("disable_default_eval_metric", "true").unwrap();
+
+        // 0 trees: predict must be exactly the base margin.
+        let preds = booster.predict(&qdm).unwrap();
+        assert_eq!(preds.len(), num_rows * n_targets);
+        for i in 0..num_rows {
+            assert_eq!(preds[i * n_targets], 0.5);
+            assert_eq!(preds[i * n_targets + 1], -1.5);
+        }
+
+        // A few rounds of custom gradients on the carried margin (squared
+        // error per target against labels / labels*2).
+        let mut preds = preds;
+        for round in 0..4 {
+            let mut grad = vec![0f32; num_rows * n_targets];
+            let hess = vec![1f32; num_rows * n_targets];
+            for i in 0..num_rows {
+                grad[i * n_targets] = preds[i * n_targets] - labels[i];
+                grad[i * n_targets + 1] = preds[i * n_targets + 1] - 2.0 * labels[i];
+            }
+            booster.boost(&qdm, round, &grad, &hess).unwrap();
+            preds = booster.predict(&qdm).unwrap();
+        }
+
+        // Trees were actually built and moved predictions toward the targets.
+        let mse_before: f32 = (0..num_rows).map(|i| (0.5 - labels[i]).powi(2)).sum::<f32>() / num_rows as f32;
+        let mse_after: f32 = (0..num_rows)
+            .map(|i| (preds[i * n_targets] - labels[i]).powi(2))
+            .sum::<f32>()
+            / num_rows as f32;
+        assert!(
+            mse_after < mse_before,
+            "boost rounds must reduce target-0 MSE ({mse_after} !< {mse_before})"
+        );
+    }
+
     /// `Booster` and `DMatrix` are `Send`: a model loaded on one thread can be
     /// moved to (used on, and dropped on) another, the pattern serving thread
     /// pools rely on. Predictions must be identical across threads.
@@ -1972,7 +2042,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.len(), half_rows);
         assert_eq!(out.capacity(), cap_before, "buffer must be reused, not reallocated");
-        assert_eq!(out[..], owned[..half_rows], "row predictions are independent of batch size");
+        assert_eq!(
+            out[..],
+            owned[..half_rows],
+            "row predictions are independent of batch size"
+        );
     }
 
     #[test]
@@ -2008,7 +2082,11 @@ mod tests {
         .unwrap();
         assert_eq!(out.len(), half_rows);
         assert_eq!(out.capacity(), cap_before, "buffer must be reused, not reallocated");
-        assert_eq!(out[..], owned[..half_rows], "row predictions are independent of batch size");
+        assert_eq!(
+            out[..],
+            owned[..half_rows],
+            "row predictions are independent of batch size"
+        );
     }
 
     #[test]
