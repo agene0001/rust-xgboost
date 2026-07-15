@@ -37,6 +37,15 @@ XGB_BUILD_NATIVE = "1"
 XGB_BUILD_IPO = "1"
 ```
 
+**Transitive dependency chains:** these env vars must be pinned in the
+**final binary's** workspace — the project where `cargo build` actually runs.
+`.cargo/config.toml` does not travel with a dependency: if a library that
+wraps this crate pins the vars in its own repo, that works for the library's
+tests and benches but is silently ignored when a higher-level project builds
+the library as a dependency (that project gets a default portable libxgboost).
+Every deployable at the top of the chain needs the `[env]` block above in its
+own `.cargo/config.toml` or CI environment.
+
 ## 2. Serving small batches (< ~1000 rows per call)
 
 ### a. Pin the booster to one thread after loading
@@ -115,7 +124,23 @@ predictions.
   call `booster.reset()` to free XGBoost's internal training caches (gradient
   buffers, prediction caches) without touching the model.
 
-## 4. Data-format thresholds (already automatic — don't work around them)
+## 4. If you are a library wrapping this crate
+
+The API-level optimizations above (thread pinning, inplace prediction, buffer
+reuse) live in *your* code, and your consumers inherit them automatically — a
+higher-level project calling your API needs no `xgb`-specific changes. Two
+things do cross the boundary to your consumers; state them in your docs:
+
+- **Build flags don't propagate** (see the transitive-chain note in section 1):
+  the final binary's workspace must pin `XGB_BUILD_NATIVE`/`XGB_BUILD_IPO`
+  itself, or it gets a default portable libxgboost.
+- **Document your tuning regime**: say which batch sizes and threading model
+  you optimized for (e.g. "single-row/small-batch, one booster per worker
+  thread, `nthread=1`"). If a consumer funnels 100k-row batches through an API
+  tuned for single rows (or vice versa), the `nthread` choice inverts — above
+  roughly 1000 rows per call, multithreaded prediction wins again.
+
+## 5. Data-format thresholds (already automatic — don't work around them)
 
 `DMatrix::from_dense` and `from_csr`/`from_csc` internally auto-select single-
 vs multi-threaded construction based on empirically benchmarked crossover
