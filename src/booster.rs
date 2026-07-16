@@ -1483,6 +1483,116 @@ mod tests {
         }
     }
 
+    /// Deterministic regression data with spread: y depends on x plus a
+    /// repeating offset, so different quantiles/expectiles of y|x separate.
+    fn synthetic_spread(num_rows: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut data = Vec::with_capacity(num_rows);
+        let mut labels = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let x = (i % 16) as f32;
+            data.push(x);
+            labels.push(x + (i % 7) as f32); // spread of 0..6 around x
+        }
+        (data, labels)
+    }
+
+    fn train_with_objective(objective: learning::Objective, dmat: &DMatrix, rounds: i32) -> Booster {
+        let learning_params = learning::LearningTaskParametersBuilder::default()
+            .objective(objective)
+            .build()
+            .unwrap();
+        let params = parameters::BoosterParametersBuilder::default()
+            .learning_params(learning_params)
+            .verbose(false)
+            .build()
+            .unwrap();
+        let mut booster = Booster::new_with_cached_dmats(&params, &[dmat]).unwrap();
+        for i in 0..rounds {
+            booster.update(dmat, i).unwrap();
+        }
+        booster
+    }
+
+    /// Multi-quantile / multi-expectile objectives: one output column per
+    /// alpha, and the columns must be ordered (mean of the 0.1-quantile
+    /// predictions below the mean of the 0.9-quantile predictions).
+    #[test]
+    fn quantile_and_expectile_objectives() {
+        let num_rows = 256;
+        let (data, labels) = synthetic_spread(num_rows);
+        let mut dmat = DMatrix::from_dense(&data, num_rows).unwrap();
+        dmat.set_labels(&labels).unwrap();
+
+        let booster = train_with_objective(learning::Objective::RegQuantile(vec![0.1, 0.5, 0.9]), &dmat, 20);
+        let preds = booster.predict(&dmat).unwrap();
+        assert_eq!(preds.len(), num_rows * 3, "one prediction column per quantile");
+        let col_mean = |c: usize| preds.iter().skip(c).step_by(3).sum::<f32>() / num_rows as f32;
+        assert!(col_mean(0) < col_mean(1), "q0.1 mean must be below q0.5 mean");
+        assert!(col_mean(1) < col_mean(2), "q0.5 mean must be below q0.9 mean");
+
+        // Expectile regression is new in XGBoost 3.3.
+        let booster = train_with_objective(learning::Objective::RegExpectile(vec![0.25, 0.75]), &dmat, 20);
+        let preds = booster.predict(&dmat).unwrap();
+        assert_eq!(preds.len(), num_rows * 2, "one prediction column per expectile");
+        let col_mean = |c: usize| preds.iter().skip(c).step_by(2).sum::<f32>() / num_rows as f32;
+        assert!(col_mean(0) < col_mean(1), "e0.25 mean must be below e0.75 mean");
+
+        // Builder validation: empty and out-of-range alphas are rejected.
+        assert!(
+            learning::LearningTaskParametersBuilder::default()
+                .objective(learning::Objective::RegQuantile(vec![]))
+                .build()
+                .is_err()
+        );
+        assert!(
+            learning::LearningTaskParametersBuilder::default()
+                .objective(learning::Objective::RegExpectile(vec![1.5]))
+                .build()
+                .is_err()
+        );
+    }
+
+    /// Categorical feature support: marking a column "c" makes XGBoost use
+    /// categorical splits for it. y depends only on whether the categorical
+    /// feature equals 2, which a categorical split can express exactly.
+    #[test]
+    fn categorical_feature_training() {
+        let num_rows = 256;
+        let mut data = Vec::with_capacity(num_rows * 2);
+        let mut labels = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            let cat = (i % 4) as f32; // categories 0..3
+            data.push(cat);
+            data.push((i % 10) as f32 / 10.0); // irrelevant quantitative feature
+            labels.push(if cat == 2.0 { 1.0 } else { 0.0 });
+        }
+        let mut dmat = DMatrix::from_dense(&data, num_rows).unwrap();
+        dmat.set_labels(&labels).unwrap();
+        dmat.set_feature_types(&["c", "q"]).unwrap();
+        assert_eq!(dmat.get_feature_types().unwrap(), vec!["c", "q"]);
+
+        let booster = train_with_objective(learning::Objective::RegLinear, &dmat, 20);
+        let preds = booster.predict(&dmat).unwrap();
+        assert_eq!(preds.len(), num_rows);
+        let (mut cat2_sum, mut rest_sum, mut cat2_n, mut rest_n) = (0f32, 0f32, 0, 0);
+        for (i, p) in preds.iter().enumerate() {
+            if i % 4 == 2 {
+                cat2_sum += p;
+                cat2_n += 1;
+            } else {
+                rest_sum += p;
+                rest_n += 1;
+            }
+        }
+        let (cat2_mean, rest_mean) = (cat2_sum / cat2_n as f32, rest_sum / rest_n as f32);
+        assert!(
+            cat2_mean > 0.9 && rest_mean < 0.1,
+            "categorical split must separate cat==2 (mean {}) from the rest (mean {})",
+            cat2_mean,
+            rest_mean
+        );
+    }
+
     /// XGBoost 3.3 deprecated `booster=dart` (remapped internally to gbtree
     /// with dropout params) and `booster=gblinear` (removal planned). Both
     /// must keep training and predicting until upstream actually removes

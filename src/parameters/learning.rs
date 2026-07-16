@@ -7,7 +7,7 @@ use std::default::Default;
 use super::Interval;
 
 /// Learning objective used when training a booster model.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub enum Objective {
     /// Linear regression.
     #[default]
@@ -59,30 +59,38 @@ pub enum Objective {
     ///
     /// Set to `None` to use XGBoost's default (currently `1.5`).
     RegTweedie(Option<f32>),
-}
 
-impl Copy for Objective {}
+    /// Quantile regression with the pinball loss.
+    ///
+    /// Takes the list of quantiles to estimate (each in `(0, 1)`); the trained
+    /// model produces one prediction column per quantile, so `predict` output
+    /// has length `num_rows * alphas.len()` (row-major).
+    RegQuantile(Vec<f32>),
 
-impl Clone for Objective {
-    fn clone(&self) -> Self {
-        *self
-    }
+    /// Expectile regression (XGBoost 3.3+).
+    ///
+    /// Takes the list of expectiles to estimate (each in `(0, 1)`); like
+    /// [`RegQuantile`](Self::RegQuantile), the model produces one prediction
+    /// column per expectile.
+    RegExpectile(Vec<f32>),
 }
 
 impl std::fmt::Display for Objective {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let result = match *self {
-            Objective::RegLinear => "reg:squarederror".to_owned(),
-            Objective::RegLogistic => "reg:logistic".to_owned(),
-            Objective::BinaryLogistic => "binary:logistic".to_owned(),
-            Objective::BinaryLogisticRaw => "binary:logitraw".to_owned(),
-            Objective::CountPoisson => "count:poisson".to_owned(),
-            Objective::SurvivalCox => "survival:cox".to_owned(),
-            Objective::MultiSoftmax(_) => "multi:softmax".to_owned(), // num_class conf must also be set
-            Objective::MultiSoftprob(_) => "multi:softprob".to_owned(), // num_class conf must also be set
-            Objective::RankPairwise => "rank:pairwise".to_owned(),
-            Objective::RegGamma => "reg:gamma".to_owned(),
-            Objective::RegTweedie(_) => "reg:tweedie".to_owned(),
+        let result = match self {
+            Objective::RegLinear => "reg:squarederror",
+            Objective::RegLogistic => "reg:logistic",
+            Objective::BinaryLogistic => "binary:logistic",
+            Objective::BinaryLogisticRaw => "binary:logitraw",
+            Objective::CountPoisson => "count:poisson",
+            Objective::SurvivalCox => "survival:cox",
+            Objective::MultiSoftmax(_) => "multi:softmax", // num_class conf must also be set
+            Objective::MultiSoftprob(_) => "multi:softprob", // num_class conf must also be set
+            Objective::RankPairwise => "rank:pairwise",
+            Objective::RegGamma => "reg:gamma",
+            Objective::RegTweedie(_) => "reg:tweedie",
+            Objective::RegQuantile(_) => "reg:quantileerror", // quantile_alpha must also be set
+            Objective::RegExpectile(_) => "reg:expectileerror", // expectile_alpha must also be set
         };
         write!(f, "{}", result)
     }
@@ -283,15 +291,40 @@ impl LearningTaskParameters {
         self.seed = seed;
     }
 
+    /// Render an alpha list as `[a,b,...]` for XGBoost's ParamArray parser.
+    fn alpha_list(alphas: &[f32]) -> String {
+        let mut s = String::from("[");
+        for (i, a) in alphas.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&a.to_string());
+        }
+        s.push(']');
+        s
+    }
+
     pub(crate) fn as_string_pairs(&self) -> Vec<(String, String)> {
         let mut v = Vec::new();
 
-        if let Objective::MultiSoftmax(n) = self.objective {
-            v.push(("num_class".to_owned(), n.to_string()));
-        } else if let Objective::MultiSoftprob(n) = self.objective {
-            v.push(("num_class".to_owned(), n.to_string()));
-        } else if let Objective::RegTweedie(Some(n)) = self.objective {
-            v.push(("tweedie_variance_power".to_owned(), n.to_string()));
+        match &self.objective {
+            Objective::MultiSoftmax(n) | Objective::MultiSoftprob(n) => {
+                v.push(("num_class".to_owned(), n.to_string()));
+            }
+            Objective::RegTweedie(Some(n)) => {
+                v.push(("tweedie_variance_power".to_owned(), n.to_string()));
+            }
+            // The alpha lists are sent in `[a, b, ...]` form: XGBoost's
+            // ParamArray parser accepts a JSON-style array (see the bundled
+            // src/common/param_array.cc), matching what the Python binding
+            // sends for lists.
+            Objective::RegQuantile(alphas) => {
+                v.push(("quantile_alpha".to_owned(), Self::alpha_list(alphas)));
+            }
+            Objective::RegExpectile(alphas) => {
+                v.push(("expectile_alpha".to_owned(), Self::alpha_list(alphas)));
+            }
+            _ => {}
         }
 
         v.push(("objective".to_owned(), self.objective.to_string()));
@@ -314,8 +347,32 @@ impl LearningTaskParameters {
 
 impl LearningTaskParametersBuilder {
     fn validate(&self) -> Result<(), String> {
-        if let Some(Objective::RegTweedie(variance_power)) = self.objective {
-            Interval::new_closed_closed(1.0, 2.0).validate(&variance_power, "tweedie_variance_power")?;
+        match &self.objective {
+            Some(Objective::RegTweedie(variance_power)) => {
+                Interval::new_closed_closed(1.0, 2.0).validate(variance_power, "tweedie_variance_power")?;
+            }
+            Some(Objective::RegQuantile(alphas)) => {
+                Self::validate_alphas(alphas, "quantile_alpha")?;
+            }
+            Some(Objective::RegExpectile(alphas)) => {
+                Self::validate_alphas(alphas, "expectile_alpha")?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Alpha lists must be non-empty with every value strictly inside (0, 1);
+    /// XGBoost rejects values outside that range at configure time, but with a
+    /// far less direct error message.
+    fn validate_alphas(alphas: &[f32], name: &str) -> Result<(), String> {
+        if alphas.is_empty() {
+            return Err(format!("{} must contain at least one value", name));
+        }
+        for a in alphas {
+            if !(*a > 0.0 && *a < 1.0) {
+                return Err(format!("{} values must be in (0, 1), got {}", name, a));
+            }
         }
         Ok(())
     }

@@ -616,6 +616,65 @@ impl DMatrix {
         self.get_uint_info(KEY_GROUP_PTR)
     }
 
+    /// Set the type of each feature, enabling categorical splits for columns
+    /// marked categorical.
+    ///
+    /// One entry per column: `"q"` (quantitative/float), `"c"` (categorical),
+    /// `"int"` (integer) or `"i"` (boolean). For categorical columns the data
+    /// values must be non-negative integers (encoded as `f32`, e.g. `0.0`,
+    /// `1.0`, ...); XGBoost 3.3+ then uses categorical splits for them with the
+    /// `hist` tree method — no one-hot encoding needed.
+    pub fn set_feature_types(&mut self, types: &[&str]) -> XGBResult<()> {
+        self.set_str_info(c"feature_type", types)
+    }
+
+    /// Get the per-column feature types previously set with
+    /// [`set_feature_types`](Self::set_feature_types) (empty if never set).
+    pub fn get_feature_types(&self) -> XGBResult<Vec<String>> {
+        self.get_str_info(c"feature_type")
+    }
+
+    /// Set the name of each feature (one entry per column).
+    pub fn set_feature_names(&mut self, names: &[&str]) -> XGBResult<()> {
+        self.set_str_info(c"feature_name", names)
+    }
+
+    /// Get the per-column feature names (empty if never set).
+    pub fn get_feature_names(&self) -> XGBResult<Vec<String>> {
+        self.get_str_info(c"feature_name")
+    }
+
+    fn set_str_info(&mut self, field: &CStr, values: &[&str]) -> XGBResult<()> {
+        // Owned CStrings must outlive the FFI call; the pointer array borrows them.
+        let owned: Vec<ffi::CString> = values.iter().map(|s| ffi::CString::new(*s).unwrap()).collect();
+        let mut ptrs: Vec<*const libc::c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+        xgb_call!(xgboost_sys::XGDMatrixSetStrFeatureInfo(
+            self.handle,
+            field.as_ptr(),
+            ptrs.as_mut_ptr(),
+            values.len() as xgboost_sys::bst_ulong
+        ))
+    }
+
+    fn get_str_info(&self, field: &CStr) -> XGBResult<Vec<String>> {
+        let mut out_len = 0;
+        let mut out = ptr::null_mut();
+        xgb_call!(xgboost_sys::XGDMatrixGetStrFeatureInfo(
+            self.handle,
+            field.as_ptr(),
+            &mut out_len,
+            &mut out
+        ))?;
+        if out_len == 0 {
+            return Ok(Vec::new());
+        }
+        let out_ptr_slice = unsafe { slice::from_raw_parts(out, out_len as usize) };
+        Ok(out_ptr_slice
+            .iter()
+            .map(|str_ptr| unsafe { ffi::CStr::from_ptr(*str_ptr).to_str().unwrap().to_owned() })
+            .collect())
+    }
+
     fn get_float_info(&self, field: &CStr) -> XGBResult<&[f32]> {
         let mut out_len = 0;
         let mut out_dptr = ptr::null();
