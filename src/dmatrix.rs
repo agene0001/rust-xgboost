@@ -34,6 +34,36 @@ pub(crate) fn make_array_interface_u64(data: &[u64]) -> String {
     )
 }
 
+/// Reject missing-value sentinels the JSON configs cannot represent.
+///
+/// Applied uniformly across the constructors (including the ones that pass the
+/// float directly) so `missing` has one contract everywhere: finite or NaN.
+pub(crate) fn validate_missing(missing: f32) -> XGBResult<()> {
+    if missing.is_nan() || missing.is_finite() {
+        Ok(())
+    } else {
+        Err(XGBError::new(format!("missing value must be finite or NaN, got {missing}")))
+    }
+}
+
+/// Render a missing value as a literal XGBoost's JSON config parser accepts
+/// (`NaN` for NaN — the same spelling the static configs use).
+pub(crate) fn missing_json(missing: f32) -> XGBResult<String> {
+    validate_missing(missing)?;
+    Ok(if missing.is_nan() {
+        "NaN".to_owned()
+    } else {
+        missing.to_string()
+    })
+}
+
+/// Build the `XGDMatrixCreateFromCSR`/`CSC` ingestion config.
+fn build_ingest_config(missing: f32, single_thread: bool) -> XGBResult<ffi::CString> {
+    let nthread = if single_thread { r#", "nthread": 1"# } else { "" };
+    let config = format!(r#"{{"missing": {}{}}}"#, missing_json(missing)?, nthread);
+    Ok(ffi::CString::new(config).unwrap())
+}
+
 /// Creates a JSON-encoded array interface string for u32 data.
 fn make_array_interface_u32(data: &[u32]) -> String {
     let ptr = data.as_ptr() as usize;
@@ -224,14 +254,29 @@ impl DMatrix {
     /// let dmat = DMatrix::from_dense(data, num_rows).unwrap();
     /// ```
     pub fn from_dense(data: &[f32], num_rows: usize) -> XGBResult<Self> {
+        Self::from_dense_with_missing(data, num_rows, f32::NAN)
+    }
+
+    /// Like [`from_dense`](Self::from_dense), but treats `missing` as the
+    /// missing-value sentinel instead of NaN.
+    ///
+    /// For data that encodes missing as e.g. `0.0` or `-999.0`, this lets
+    /// XGBoost drop those entries during its own ingestion pass instead of the
+    /// caller rewriting the whole array to NaN first (a full O(n) copy).
+    /// `missing` must be finite or NaN.
+    pub fn from_dense_with_missing(data: &[f32], num_rows: usize, missing: f32) -> XGBResult<Self> {
         // Three-way benchmark of the dense creation APIs
         // (benches/dmatrix_benchmark.rs, `from_dense` group):
         //   - XGDMatrixCreateFromMat: fastest below ~50k elements (no thread setup)
         //   - XGDMatrixCreateFromMat_omp: fastest above (~1.5x the array-interface
         //     XGDMatrixCreateFromDense at 500k+, ~5x plain CreateFromMat)
-        // Neither is deprecated, so dispatch on the measured crossover. NaN is the
-        // missing value in both paths, matching historical behavior.
+        // Neither is deprecated, so dispatch on the measured crossover.
         const PARALLEL_THRESHOLD: usize = 50_000;
+
+        // CreateFromMat takes the float directly, so no JSON rendering is
+        // involved — but reject infinities anyway to keep the missing-value
+        // contract identical across the dense/CSR/CSC constructors.
+        validate_missing(missing)?;
 
         // Guard the shape inference: without this, num_rows = 0 dies on a bare
         // integer division panic, and a non-divisible length silently drops the
@@ -252,7 +297,7 @@ impl DMatrix {
                 data.as_ptr(),
                 num_rows as xgboost_sys::bst_ulong,
                 num_cols,
-                f32::NAN,
+                missing,
                 &mut handle
             ))?;
         } else {
@@ -260,11 +305,46 @@ impl DMatrix {
                 data.as_ptr(),
                 num_rows as xgboost_sys::bst_ulong,
                 num_cols,
-                f32::NAN,
+                missing,
                 &mut handle,
                 0 // <=0 means use all available cores
             ))?;
         }
+        DMatrix::new(handle)
+    }
+
+    /// Create a new `DMatrix` from a dense row-major `f64` slice.
+    ///
+    /// Uses the array-interface entry point (`XGDMatrixCreateFromDense`) with a
+    /// `<f8` typestr, so the f64→f32 narrowing happens inside XGBoost's own
+    /// mandatory ingestion copy — callers holding f64 data avoid converting
+    /// the whole array to f32 in Rust first (an extra full-array copy). NaN is
+    /// the missing value, matching [`from_dense`](Self::from_dense).
+    pub fn from_dense_f64(data: &[f64], num_rows: usize) -> XGBResult<Self> {
+        // Same shape guard as `from_dense`.
+        if num_rows == 0 || !data.len().is_multiple_of(num_rows) {
+            return Err(XGBError::new(format!(
+                "data length {} does not divide into num_rows {}",
+                data.len(),
+                num_rows
+            )));
+        }
+        let num_cols = data.len() / num_rows;
+        let interface = format!(
+            r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f8","version":3}}"#,
+            data.as_ptr() as usize,
+            num_rows,
+            num_cols
+        );
+        let interface_cstr = ffi::CString::new(interface).unwrap();
+        let config: &CStr = cr#"{"missing": NaN, "nthread": 0}"#;
+
+        let mut handle = ptr::null_mut();
+        xgb_call!(xgboost_sys::XGDMatrixCreateFromDense(
+            interface_cstr.as_ptr(),
+            config.as_ptr(),
+            &mut handle
+        ))?;
         DMatrix::new(handle)
     }
 
@@ -302,7 +382,46 @@ impl DMatrix {
         );
         let data_cstr = ffi::CString::new(data_interface).unwrap();
 
-        Self::quantile_from_batch(BatchData::Dense(data_cstr), labels, max_bin)
+        Self::quantile_from_batch(BatchData::Dense(data_cstr), labels, max_bin, None)
+    }
+
+    /// Like [`from_dense_quantile`](Self::from_dense_quantile), but shares the
+    /// bin cuts of `ref_matrix` instead of sketching them from `data`.
+    ///
+    /// This is what Python's `QuantileDMatrix(..., ref=dtrain)` does: build the
+    /// training matrix without a ref, then build validation/eval matrices
+    /// against it so all of them quantize identically — independently sketched
+    /// cuts make eval metrics subtly incomparable, and holding eval sets as
+    /// full `DMatrix` instead costs ~4x the memory. `ref_matrix` should be the
+    /// quantile matrix used for training, built with the same `max_bin`.
+    pub fn from_dense_quantile_ref(
+        data: &[f32],
+        num_rows: usize,
+        labels: Option<&[f32]>,
+        max_bin: u32,
+        ref_matrix: &DMatrix,
+    ) -> XGBResult<Self> {
+        if let Some(l) = labels {
+            assert_eq!(l.len(), num_rows, "labels length must equal num_rows");
+        }
+        // Same shape guard as `from_dense`.
+        if num_rows == 0 || !data.len().is_multiple_of(num_rows) {
+            return Err(XGBError::new(format!(
+                "data length {} does not divide into num_rows {}",
+                data.len(),
+                num_rows
+            )));
+        }
+        let num_cols = data.len() / num_rows;
+        let data_interface = format!(
+            r#"{{"data":[{},false],"shape":[{},{}],"strides":null,"typestr":"<f4","version":3}}"#,
+            data.as_ptr() as usize,
+            num_rows,
+            num_cols
+        );
+        let data_cstr = ffi::CString::new(data_interface).unwrap();
+
+        Self::quantile_from_batch(BatchData::Dense(data_cstr), labels, max_bin, Some(ref_matrix))
     }
 
     /// Create a `QuantileDMatrix` from a sparse CSR matrix, the sparse
@@ -329,11 +448,43 @@ impl DMatrix {
             values: ffi::CString::new(make_array_interface_f32(data)).unwrap(),
             num_cols,
         };
-        Self::quantile_from_batch(batch, labels, max_bin)
+        Self::quantile_from_batch(batch, labels, max_bin, None)
     }
 
-    /// Shared `QuantileDMatrix` construction from a single prepared batch.
-    fn quantile_from_batch(data: BatchData, labels: Option<&[f32]>, max_bin: u32) -> XGBResult<Self> {
+    /// Like [`from_csr_quantile`](Self::from_csr_quantile), but shares the bin
+    /// cuts of `ref_matrix`; see
+    /// [`from_dense_quantile_ref`](Self::from_dense_quantile_ref) for when and
+    /// why.
+    pub fn from_csr_quantile_ref(
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: usize,
+        labels: Option<&[f32]>,
+        max_bin: u32,
+        ref_matrix: &DMatrix,
+    ) -> XGBResult<Self> {
+        assert_eq!(indices.len(), data.len());
+        if let Some(l) = labels {
+            assert_eq!(l.len(), indptr.len() - 1, "labels length must equal num_rows");
+        }
+        let batch = BatchData::Csr {
+            indptr: ffi::CString::new(make_array_interface_u64(indptr)).unwrap(),
+            indices: ffi::CString::new(make_array_interface_u64(indices)).unwrap(),
+            values: ffi::CString::new(make_array_interface_f32(data)).unwrap(),
+            num_cols,
+        };
+        Self::quantile_from_batch(batch, labels, max_bin, Some(ref_matrix))
+    }
+
+    /// Shared `QuantileDMatrix` construction from a single prepared batch,
+    /// optionally aligned to the bin cuts of a reference matrix.
+    fn quantile_from_batch(
+        data: BatchData,
+        labels: Option<&[f32]>,
+        max_bin: u32,
+        ref_matrix: Option<&DMatrix>,
+    ) -> XGBResult<Self> {
         let mut proxy = ptr::null_mut();
         xgb_call!(xgboost_sys::XGProxyDMatrixCreate(&mut proxy))?;
 
@@ -350,11 +501,14 @@ impl DMatrix {
         let mut out = ptr::null_mut();
         // SAFETY: `iter` outlives the (synchronous) call; the callbacks only ever
         // dereference the handle we pass and never unwind across the boundary.
+        // The `ref` argument is typed DataIterHandle in the C API but is
+        // dereferenced as a DMatrixHandle (`shared_ptr<DMatrix>*`) — passing a
+        // DMatrix handle here is exactly what the Python binding does.
         let ret = unsafe {
             xgboost_sys::XGQuantileDMatrixCreateFromCallback(
                 &mut iter as *mut BatchIter as xgboost_sys::DataIterHandle,
                 proxy,
-                ptr::null_mut(), // no reference matrix for quantile alignment
+                ref_matrix.map_or(ptr::null_mut(), |m| m.handle),
                 Some(batch_iter_reset),
                 Some(batch_iter_next),
                 config_cstr.as_ptr(),
@@ -382,6 +536,20 @@ impl DMatrix {
     /// to avoid thread synchronization overhead. For larger matrices, multi-threaded creation
     /// is used for better performance.
     pub fn from_csr(indptr: &[u64], indices: &[u64], data: &[f32], num_cols: Option<usize>) -> XGBResult<Self> {
+        Self::from_csr_with_missing(indptr, indices, data, num_cols, f32::NAN)
+    }
+
+    /// Like [`from_csr`](Self::from_csr), but treats `missing` as the
+    /// missing-value sentinel instead of NaN; see
+    /// [`from_dense_with_missing`](Self::from_dense_with_missing) for the
+    /// rationale. `missing` must be finite or NaN.
+    pub fn from_csr_with_missing(
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_cols: Option<usize>,
+        missing: f32,
+    ) -> XGBResult<Self> {
         // Threshold below which single-threaded is faster due to thread overhead.
         // Benchmarking shows crossover point is around 30k non-zeros on typical hardware.
         const SINGLE_THREAD_THRESHOLD: usize = 30000;
@@ -399,18 +567,14 @@ impl DMatrix {
         let data_cstr = ffi::CString::new(data_interface).unwrap();
 
         // Use single thread for small matrices to avoid thread synchronization overhead
-        let config: &CStr = if data.len() < SINGLE_THREAD_THRESHOLD {
-            cr#"{"missing": NaN, "nthread": 1}"#
-        } else {
-            cr#"{"missing": NaN}"#
-        };
+        let config_cstr = build_ingest_config(missing, data.len() < SINGLE_THREAD_THRESHOLD)?;
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSR(
             indptr_cstr.as_ptr(),
             indices_cstr.as_ptr(),
             data_cstr.as_ptr(),
             num_cols,
-            config.as_ptr(),
+            config_cstr.as_ptr(),
             &mut handle
         ))?;
         DMatrix::new(handle)
@@ -429,6 +593,20 @@ impl DMatrix {
     /// to avoid thread synchronization overhead. For larger matrices, multi-threaded creation
     /// is used for better performance.
     pub fn from_csc(indptr: &[u64], indices: &[u64], data: &[f32], num_rows: Option<usize>) -> XGBResult<Self> {
+        Self::from_csc_with_missing(indptr, indices, data, num_rows, f32::NAN)
+    }
+
+    /// Like [`from_csc`](Self::from_csc), but treats `missing` as the
+    /// missing-value sentinel instead of NaN; see
+    /// [`from_dense_with_missing`](Self::from_dense_with_missing) for the
+    /// rationale. `missing` must be finite or NaN.
+    pub fn from_csc_with_missing(
+        indptr: &[u64],
+        indices: &[u64],
+        data: &[f32],
+        num_rows: Option<usize>,
+        missing: f32,
+    ) -> XGBResult<Self> {
         // Threshold below which single-threaded is faster due to thread overhead.
         // Benchmarking shows crossover point is around 30k non-zeros on typical hardware.
         const SINGLE_THREAD_THRESHOLD: usize = 30000;
@@ -446,18 +624,14 @@ impl DMatrix {
         let data_cstr = ffi::CString::new(data_interface).unwrap();
 
         // Use single thread for small matrices to avoid thread synchronization overhead
-        let config: &CStr = if data.len() < SINGLE_THREAD_THRESHOLD {
-            cr#"{"missing": NaN, "nthread": 1}"#
-        } else {
-            cr#"{"missing": NaN}"#
-        };
+        let config_cstr = build_ingest_config(missing, data.len() < SINGLE_THREAD_THRESHOLD)?;
 
         xgb_call!(xgboost_sys::XGDMatrixCreateFromCSC(
             indptr_cstr.as_ptr(),
             indices_cstr.as_ptr(),
             data_cstr.as_ptr(),
             num_rows,
-            config.as_ptr(),
+            config_cstr.as_ptr(),
             &mut handle
         ))?;
         DMatrix::new(handle)
@@ -624,6 +798,12 @@ impl DMatrix {
     /// values must be non-negative integers (encoded as `f32`, e.g. `0.0`,
     /// `1.0`, ...); XGBoost 3.3+ then uses categorical splits for them with the
     /// `hist` tree method — no one-hot encoding needed.
+    ///
+    /// **Call this before the DMatrix is first used for training.** XGBoost
+    /// caches the quantized gradient index it builds on first use, and the
+    /// cache key does not include feature types — changing them on a DMatrix
+    /// that has already trained a booster silently reuses the old
+    /// numeric-sketched index (this getter will still report the new types).
     pub fn set_feature_types(&mut self, types: &[&str]) -> XGBResult<()> {
         self.set_str_info(c"feature_type", types)
     }
@@ -646,7 +826,13 @@ impl DMatrix {
 
     fn set_str_info(&mut self, field: &CStr, values: &[&str]) -> XGBResult<()> {
         // Owned CStrings must outlive the FFI call; the pointer array borrows them.
-        let owned: Vec<ffi::CString> = values.iter().map(|s| ffi::CString::new(*s).unwrap()).collect();
+        let owned: Vec<ffi::CString> = values
+            .iter()
+            .map(|s| {
+                ffi::CString::new(*s)
+                    .map_err(|_| XGBError::new(format!("string info value contains an interior NUL byte: {s:?}")))
+            })
+            .collect::<XGBResult<_>>()?;
         let mut ptrs: Vec<*const libc::c_char> = owned.iter().map(|s| s.as_ptr()).collect();
         xgb_call!(xgboost_sys::XGDMatrixSetStrFeatureInfo(
             self.handle,
@@ -669,10 +855,16 @@ impl DMatrix {
             return Ok(Vec::new());
         }
         let out_ptr_slice = unsafe { slice::from_raw_parts(out, out_len as usize) };
-        Ok(out_ptr_slice
+        out_ptr_slice
             .iter()
-            .map(|str_ptr| unsafe { ffi::CStr::from_ptr(*str_ptr).to_str().unwrap().to_owned() })
-            .collect())
+            .map(|str_ptr| {
+                unsafe { ffi::CStr::from_ptr(*str_ptr) }
+                    .to_str()
+                    .map(str::to_owned)
+                    // Possible on a DMatrix written by another binding.
+                    .map_err(|e| XGBError::new(format!("string info value is not valid UTF-8: {e}")))
+            })
+            .collect()
     }
 
     fn get_float_info(&self, field: &CStr) -> XGBResult<&[f32]> {
@@ -851,6 +1043,104 @@ mod tests {
         let dmat = DMatrix::from_csc(&indptr, &indices, &data, Some(10)).unwrap();
         assert_eq!(dmat.num_rows(), 10);
         assert_eq!(dmat.num_cols(), 4);
+    }
+
+    /// Entries stored in the DMatrix (i.e. not dropped as missing).
+    fn num_non_missing(dmat: &DMatrix) -> u64 {
+        let mut out = 0;
+        let ret = unsafe { xgboost_sys::XGDMatrixNumNonMissing(dmat.handle, &mut out) };
+        XGBError::check_return_value(ret).unwrap();
+        out
+    }
+
+    #[test]
+    fn from_dense_with_missing_drops_sentinel() {
+        let data = [1.0, -999.0, 3.0, 4.0, -999.0, 6.0];
+
+        // Default NaN missing: all 6 entries present.
+        let dmat = DMatrix::from_dense(&data, 2).unwrap();
+        assert_eq!(num_non_missing(&dmat), 6);
+
+        // Sentinel missing: the two -999 entries drop out during ingestion.
+        let dmat = DMatrix::from_dense_with_missing(&data, 2, -999.0).unwrap();
+        assert_eq!(dmat.shape(), (2, 3));
+        assert_eq!(num_non_missing(&dmat), 4);
+
+        // Infinities are unrepresentable in the shared config contract.
+        assert!(DMatrix::from_dense_with_missing(&data, 2, f32::INFINITY).is_err());
+    }
+
+    #[test]
+    fn from_csr_with_missing_drops_sentinel() {
+        let indptr: [u64; 3] = [0, 2, 4];
+        let indices: [u64; 4] = [0, 1, 0, 1];
+        let data = [1.0, -999.0, -999.0, 4.0];
+
+        let dmat = DMatrix::from_csr_with_missing(&indptr, &indices, &data, Some(2), -999.0).unwrap();
+        assert_eq!(dmat.num_rows(), 2);
+        assert_eq!(num_non_missing(&dmat), 2);
+    }
+
+    #[test]
+    fn from_csc_with_missing_drops_sentinel() {
+        let indptr: [u64; 3] = [0, 2, 4];
+        let indices: [u64; 4] = [0, 1, 0, 1];
+        let data = [1.0, -999.0, -999.0, 4.0];
+
+        let dmat = DMatrix::from_csc_with_missing(&indptr, &indices, &data, None, -999.0).unwrap();
+        assert_eq!(dmat.num_rows(), 2);
+        assert_eq!(num_non_missing(&dmat), 2);
+    }
+
+    #[test]
+    fn from_dense_f64_matches_f32_ingestion() {
+        let data_f64 = [1.5f64, f64::NAN, 3.25, 4.0, 5.0, 6.0];
+        let data_f32: Vec<f32> = data_f64.iter().map(|&v| v as f32).collect();
+
+        let dmat64 = DMatrix::from_dense_f64(&data_f64, 3).unwrap();
+        let dmat32 = DMatrix::from_dense(&data_f32, 3).unwrap();
+
+        assert_eq!(dmat64.shape(), (3, 2));
+        assert_eq!(dmat64.shape(), dmat32.shape());
+        // The NaN drops out in both paths; the remaining 5 entries survive.
+        assert_eq!(num_non_missing(&dmat64), 5);
+        assert_eq!(num_non_missing(&dmat64), num_non_missing(&dmat32));
+
+        // Same shape guards as from_dense.
+        assert!(DMatrix::from_dense_f64(&data_f64, 0).is_err());
+        assert!(DMatrix::from_dense_f64(&data_f64, 4).is_err());
+    }
+
+    #[test]
+    fn from_dense_quantile_ref_shares_cuts() {
+        let num_rows = 50;
+        let num_cols = 4;
+        let mut data = vec![0f32; num_rows * num_cols];
+        let mut labels = vec![0f32; num_rows];
+        for i in 0..num_rows {
+            for j in 0..num_cols {
+                data[i * num_cols + j] = ((i * 3 + j) % 17) as f32;
+            }
+            labels[i] = (i % 2) as f32;
+        }
+        let train = DMatrix::from_dense_quantile(&data, num_rows, Some(&labels), 64).unwrap();
+
+        // Eval slice drawn from a narrower value range than the training data:
+        // with independent sketching its cuts would differ; with `ref` they are
+        // inherited from `train`. Constructing against the ref must succeed and
+        // preserve the shape.
+        let eval_rows = 10;
+        let eval_data = &data[..eval_rows * num_cols];
+        let eval = DMatrix::from_dense_quantile_ref(eval_data, eval_rows, Some(&labels[..eval_rows]), 64, &train).unwrap();
+        assert_eq!(eval.shape(), (eval_rows, num_cols));
+        assert_eq!(eval.get_labels().unwrap(), &labels[..eval_rows]);
+
+        // CSR variant: one dense-as-sparse row set against the same ref.
+        let indptr: Vec<u64> = (0..=eval_rows as u64).map(|i| i * num_cols as u64).collect();
+        let indices: Vec<u64> = (0..eval_rows).flat_map(|_| 0..num_cols as u64).collect();
+        let eval_csr =
+            DMatrix::from_csr_quantile_ref(&indptr, &indices, eval_data, num_cols, None, 64, &train).unwrap();
+        assert_eq!(eval_csr.shape(), (eval_rows, num_cols));
     }
 
     #[test]

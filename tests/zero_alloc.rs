@@ -229,6 +229,34 @@ fn dmatrix_predict_into_is_allocation_free_when_warm() {
 }
 
 #[test]
+fn dmatrix_predict_margin_into_is_allocation_free_when_warm() {
+    // Same shape as the predict_into test, but for the margin variant — the
+    // only predict-into path previously unpinned by this suite. It shares
+    // `predict_raw` with `predict_into`, differing only in the static config,
+    // so this asserts nothing allocating creeps into that variant.
+    let (num_rows, num_cols) = (128, 16);
+    let (data, labels) = synthetic_dense(num_rows, num_cols);
+    let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+    dm.set_labels(&labels).unwrap();
+    let mut bst = trained_booster(&dm);
+    bst.set_param("nthread", "1").unwrap();
+
+    let mut out = Vec::new();
+
+    bst.predict_margin_into(&dm, &mut out).unwrap();
+    let expected = out.clone();
+
+    let allocs = count_own_allocations(|| {
+        for _ in 0..100 {
+            bst.predict_margin_into(&dm, &mut out).unwrap();
+        }
+    });
+
+    assert_eq!(out, expected, "warm calls must keep producing identical predictions");
+    assert_eq!(allocs, 0, "predict_margin_into must not allocate once warm");
+}
+
+#[test]
 fn custom_objective_round_allocates_only_objective_outputs() {
     // `boost()` builds the gradient/hessian array-interface JSON on the stack
     // (see `write_interface_{1d,2d}` in booster.rs), so the only per-round Rust

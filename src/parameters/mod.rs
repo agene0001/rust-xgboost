@@ -18,6 +18,37 @@ pub use self::booster::BoosterType;
 use super::DMatrix;
 use super::booster::CustomObjective;
 
+/// Device for training and prediction (XGBoost 3.x `device` parameter).
+///
+/// XGBoost 2.0 removed the `gpu_hist`/`gpu_exact` tree methods; GPU selection
+/// happens exclusively through this parameter, combined with a regular tree
+/// method (`hist` for GPU training). On large datasets GPU hist training is
+/// commonly 5-20x faster than CPU.
+///
+/// Note: the bundled C++ must be compiled with CUDA support (this crate's
+/// `cuda` feature) for the CUDA variants to work — on a CPU-only build XGBoost
+/// rejects them at configure time with a clear error.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Device {
+    /// CPU (XGBoost default).
+    #[default]
+    Cpu,
+    /// The first visible CUDA device.
+    Cuda,
+    /// A specific CUDA device by ordinal (`cuda:<n>`).
+    CudaOrdinal(u32),
+}
+
+impl Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Device::Cpu => write!(f, "cpu"),
+            Device::Cuda => write!(f, "cuda"),
+            Device::CudaOrdinal(n) => write!(f, "cuda:{}", n),
+        }
+    }
+}
+
 /// Parameters for training boosters.
 /// Created using [`BoosterParametersBuilder`](struct.BoosterParametersBuilder.html).
 #[derive(Builder, Clone, Default)]
@@ -40,6 +71,11 @@ pub struct BoosterParameters {
     ///
     /// *default*: `None` (XGBoost will automatically determing max threads to use)
     threads: Option<u32>,
+
+    /// Device to train and predict on (see [`Device`]).
+    ///
+    /// *default*: [`Device::Cpu`]
+    device: Device,
 }
 
 impl BoosterParameters {
@@ -87,6 +123,16 @@ impl BoosterParameters {
         self.threads = threads.into();
     }
 
+    /// Get the device XGBoost trains and predicts on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Set the device XGBoost trains and predicts on.
+    pub fn set_device(&mut self, device: Device) {
+        self.device = device;
+    }
+
     pub(crate) fn as_string_pairs(&self) -> Vec<(String, String)> {
         let mut v = Vec::new();
 
@@ -100,6 +146,12 @@ impl BoosterParameters {
 
         if let Some(nthread) = self.threads {
             v.push(("nthread".to_owned(), nthread.to_string()));
+        }
+
+        // Only emitted when non-default: "cpu" is XGBoost's default, and not
+        // sending it keeps the parameter stream identical for existing users.
+        if self.device != Device::Cpu {
+            v.push(("device".to_owned(), self.device.to_string()));
         }
 
         v
@@ -173,6 +225,28 @@ pub struct TrainingParameters<'a> {
     /// *default*: `None`
     #[builder(default = "None")]
     pub(crate) callbacks: Option<Vec<TrainingCallback>>,
+
+    /// Evaluate `evaluation_sets` only every `eval_period` rounds (plus always
+    /// on the final round), like Python's `verbose_eval=<int>`.
+    ///
+    /// Each evaluation is a full prediction pass over every evaluation set —
+    /// with an eval set comparable in size to the training data, evaluating
+    /// every round can approach half of total training time. Rounds that skip
+    /// evaluation pass `evaluation_results: None` to callbacks. `0` is treated
+    /// as `1`.
+    ///
+    /// *default*: `1` (evaluate every round)
+    #[builder(default = "1")]
+    pub(crate) eval_period: u32,
+
+    /// Whether to print evaluation results to stdout on rounds that evaluate.
+    ///
+    /// When `false`, evaluation still runs on schedule and the results still
+    /// reach callbacks — only the printing is suppressed.
+    ///
+    /// *default*: `true`
+    #[builder(default = "true")]
+    pub(crate) verbose_eval: bool,
 }
 
 impl<'a> TrainingParameters<'a> {
@@ -230,6 +304,22 @@ impl<'a> TrainingParameters<'a> {
 
     pub fn set_callbacks(&mut self, callbacks: Option<Vec<TrainingCallback>>) {
         self.callbacks = callbacks;
+    }
+
+    pub fn eval_period(&self) -> u32 {
+        self.eval_period
+    }
+
+    pub fn set_eval_period(&mut self, eval_period: u32) {
+        self.eval_period = eval_period;
+    }
+
+    pub fn verbose_eval(&self) -> bool {
+        self.verbose_eval
+    }
+
+    pub fn set_verbose_eval(&mut self, verbose_eval: bool) {
+        self.verbose_eval = verbose_eval;
     }
 }
 

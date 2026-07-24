@@ -118,21 +118,26 @@ For latency-sensitive serving of small batches (roughly under 1000 rows):
   inplace-prediction proxy — so use per-thread instances (cheap to create with
   `Booster::load_buffer`) rather than a shared reference.
 
-For training and large-batch throughput, two opt-in flags tune the `local_build`
-C++ compilation (off by default to keep binaries portable):
+For training and large-batch throughput, two flags tune the `local_build`
+C++ compilation:
 
 ```sh
-XGB_BUILD_NATIVE=1  # tune codegen for the build machine (-march/-mcpu=native)
-XGB_BUILD_IPO=1     # link-time optimization for libxgboost
+XGB_BUILD_NATIVE=0  # disable native codegen (-march/-mcpu=native); ON by default
+XGB_BUILD_IPO=1     # link-time optimization for libxgboost; off by default
 ```
 
-These only apply when building from source and the binary runs on the machine
-(or identical CPUs) it was built on. Expect the largest gains from
-`XGB_BUILD_NATIVE` on x86-64 hosts with AVX2/AVX-512.
+Native codegen is on by default because a from-source build usually runs on the
+machine that built it; disable it when deploying the locally built binary to
+other machines (or older CPUs of the same family). Expect the largest gains
+from native codegen on x86-64 hosts with AVX2/AVX-512.
 
 For large training sets with the `hist` tree method, prefer
 `DMatrix::from_dense_quantile` / `from_csr_quantile`, which store pre-binned data
-(~1 byte per value instead of 4) and skip a separate sketching pass.
+(~1 byte per value instead of 4); per-round training speed is the same as a
+regular `DMatrix` — the win is memory. The biggest training speed knobs are
+`max_bin` (256 → 64 measured ~1.7x faster per round; validate accuracy) and
+`eval_period` (evaluation sets cost a full prediction pass per round by
+default). See docs/SERVING.md §3.
 
 ## Status
 

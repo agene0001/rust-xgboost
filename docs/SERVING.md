@@ -12,28 +12,32 @@ them on your deployment machine if they matter to you.
 ## 1. Build-time: native codegen for the bundled C++
 
 All prediction/training time is spent inside libxgboost (C++), which the crate
-compiles from source by default (`local_build` feature). Two opt-in env vars
-tune that build:
+compiles from source by default (`local_build` feature). Two env vars tune that
+build:
 
-- `XGB_BUILD_NATIVE=1` — compiles libxgboost with `-march=native` (x86-64) /
+- `XGB_BUILD_NATIVE` — compiles libxgboost with `-march=native` (x86-64) /
   `-mcpu=native` (aarch64). Biggest gains on x86-64 hosts with AVX2/AVX-512.
+  **On by default** (a from-source build usually runs where it was built);
+  set `XGB_BUILD_NATIVE=0` if you deploy the locally built binary to other
+  machines — a `-march=native` build from a newer CPU will crash with an
+  illegal-instruction fault on older ones.
 - `XGB_BUILD_IPO=1` — enables link-time optimization (CMake IPO) for libxgboost.
+  Off by default (it slows the C++ build noticeably).
 
-**Only use these if the binary runs on the machine (or identical CPU family) it
-was built on.** They are off by default so release binaries stay portable — a
-`-march=native` build from a newer CPU will crash with an illegal-instruction
-fault on older ones.
+There is also `XGB_CMAKE_DEFINES="KEY=VAL;KEY2=VAL2"` for passing arbitrary
+CMake defines to the bundled build (e.g. `USE_OPENMP=OFF`,
+`BUILD_STATIC_LIB=ON`) when experimenting; note removed entries persist in
+CMakeCache.txt until set explicitly or the cmake build dir is deleted.
 
 **Critical operational detail:** the build script watches these env vars
 (`rerun-if-env-changed`). If you set them on one `cargo` command and not the
 next, cargo silently rebuilds the whole C++ library back to the default
 configuration (slow, and you lose the tuned build without noticing). Don't set
-them ad hoc in the shell — pin them in the project's `.cargo/config.toml` so
-every cargo invocation agrees:
+them ad hoc in the shell — pin any non-default values in the project's
+`.cargo/config.toml` so every cargo invocation agrees:
 
 ```toml
 [env]
-XGB_BUILD_NATIVE = "1"
 XGB_BUILD_IPO = "1"
 ```
 
@@ -109,17 +113,44 @@ predictions.
 
 ## 3. Training
 
+Profiled at 200k rows x 64 features (hist, depth 6, Apple M3 Pro): per-round
+time is ~65-70% histogram building, ~19% split evaluation, ~6% partitioning —
+i.e. genuine work, so the levers below are configuration, not code.
+
+- **`max_bin` is the biggest speed knob**: lowering it from the default 256 to
+  64 measured ~1.7-1.8x faster per round on the profile workload. Fewer bins
+  means coarser split candidates — validate accuracy on your data — but for
+  many datasets 64-128 bins lose nothing. Remember to keep a
+  `QuantileDMatrix`'s `max_bin` argument in sync when you change it.
+- **Leave `nthread` unset for training** (all cores). Measured on the M3 Pro:
+  default (12 cores incl. efficiency cores) ≥ 6 P-cores only, and ~3x faster
+  than `nthread=1`. The `nthread=1` advice in section 2 is for small-batch
+  serving only.
+- **Evaluation sets cost a full prediction pass per set per round.** By
+  default `Booster::train` evaluates (and prints) every round; with a large
+  eval set that can approach half of total wall time. Set
+  `TrainingParameters::eval_period` to evaluate every k rounds (the final
+  round always evaluates), and `verbose_eval: false` to keep the metrics for
+  callbacks without printing.
 - **Use `QuantileDMatrix` for large in-memory training sets with the `hist`
   tree method** (the default):
   ```rust
   let dtrain = DMatrix::from_dense_quantile(&data, num_rows, Some(&labels), 256)?;
   ```
-  It stores pre-binned values (~1 byte per feature value instead of 4 — roughly
-  **4x less memory**) and skips a separate sketching pass at the start of
-  training. The last argument (`max_bin`) **must match** the booster's
-  `max_bin` parameter (default 256) or training errors out. Sparse counterpart:
-  `from_csr_quantile`. Note: quantile matrices are training-only — they cannot
-  be saved with `DMatrix::save`.
+  Its win is memory, not round speed: it stores pre-binned values (~1 byte per
+  feature value instead of 4 — roughly **4x less memory**) and moves the
+  one-time sketching/binning cost from the first training round into
+  construction; steady-state per-round time measures the same as a regular
+  `DMatrix`. The last argument (`max_bin`) **must match** the booster's
+  `max_bin` parameter (default 256) or training errors out. Sparse
+  counterpart: `from_csr_quantile`; for validation sets, build with
+  `from_dense_quantile_ref`/`from_csr_quantile_ref` against the training
+  matrix so both quantize with the same bin cuts. Note: quantile matrices are
+  training-only — they cannot be saved with `DMatrix::save`.
+- **GPU training**: set `BoosterParametersBuilder::device(Device::Cuda)` with
+  `tree_method=hist` (requires building the crate with the `cuda` feature).
+  On large datasets GPU hist commonly trains 5-20x faster than CPU; pair with
+  `sampling_method: GradientBased` + low `subsample` for a further speedup.
 - After training, if you keep the booster in the same process for inference,
   call `booster.reset()` to free XGBoost's internal training caches (gradient
   buffers, prediction caches) without touching the model.
@@ -132,8 +163,11 @@ higher-level project calling your API needs no `xgb`-specific changes. Two
 things do cross the boundary to your consumers; state them in your docs:
 
 - **Build flags don't propagate** (see the transitive-chain note in section 1):
-  the final binary's workspace must pin `XGB_BUILD_NATIVE`/`XGB_BUILD_IPO`
-  itself, or it gets a default portable libxgboost.
+  any non-default `XGB_BUILD_NATIVE`/`XGB_BUILD_IPO` values must be pinned in
+  the final binary's workspace itself. The native default applies wherever the
+  build runs, so a consumer compiling on their deploy machine gets a tuned
+  libxgboost automatically — but one cross-compiling for older CPUs must set
+  `XGB_BUILD_NATIVE=0` in their own workspace.
 - **Document your tuning regime**: say which batch sizes and threading model
   you optimized for (e.g. "single-row/small-batch, one booster per worker
   thread, `nthread=1`"). If a consumer funnels 100k-row batches through an API

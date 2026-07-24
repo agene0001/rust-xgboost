@@ -263,8 +263,17 @@ impl LearningTaskParameters {
         &self.objective
     }
 
-    pub fn set_objective<T: Into<Objective>>(&mut self, objective: T) {
-        self.objective = objective.into();
+    /// Set the learning objective.
+    ///
+    /// Runs the same objective-specific validation as the builder (e.g.
+    /// quantile/expectile alpha lists non-empty and in `(0, 1)`), so invalid
+    /// values fail here with a clear message instead of an opaque C++ `CHECK`
+    /// at the first training update.
+    pub fn set_objective<T: Into<Objective>>(&mut self, objective: T) -> Result<(), String> {
+        let objective = objective.into();
+        validate_objective(&objective)?;
+        self.objective = objective;
+        Ok(())
     }
 
     pub fn base_score(&self) -> Option<f32> {
@@ -347,33 +356,38 @@ impl LearningTaskParameters {
 
 impl LearningTaskParametersBuilder {
     fn validate(&self) -> Result<(), String> {
-        match &self.objective {
-            Some(Objective::RegTweedie(variance_power)) => {
-                Interval::new_closed_closed(1.0, 2.0).validate(variance_power, "tweedie_variance_power")?;
-            }
-            Some(Objective::RegQuantile(alphas)) => {
-                Self::validate_alphas(alphas, "quantile_alpha")?;
-            }
-            Some(Objective::RegExpectile(alphas)) => {
-                Self::validate_alphas(alphas, "expectile_alpha")?;
-            }
-            _ => {}
+        if let Some(objective) = &self.objective {
+            validate_objective(objective)?;
         }
         Ok(())
     }
+}
 
-    /// Alpha lists must be non-empty with every value strictly inside (0, 1);
-    /// XGBoost rejects values outside that range at configure time, but with a
-    /// far less direct error message.
-    fn validate_alphas(alphas: &[f32], name: &str) -> Result<(), String> {
-        if alphas.is_empty() {
-            return Err(format!("{} must contain at least one value", name));
+/// Objective-specific parameter validation, shared by the builder and
+/// [`LearningTaskParameters::set_objective`] so neither entry point can smuggle
+/// values XGBoost only rejects (opaquely) at configure time.
+fn validate_objective(objective: &Objective) -> Result<(), String> {
+    match objective {
+        Objective::RegTweedie(variance_power) => {
+            Interval::new_closed_closed(1.0, 2.0).validate(variance_power, "tweedie_variance_power")
         }
-        for a in alphas {
-            if !(*a > 0.0 && *a < 1.0) {
-                return Err(format!("{} values must be in (0, 1), got {}", name, a));
-            }
-        }
-        Ok(())
+        Objective::RegQuantile(alphas) => validate_alphas(alphas, "quantile_alpha"),
+        Objective::RegExpectile(alphas) => validate_alphas(alphas, "expectile_alpha"),
+        _ => Ok(()),
     }
+}
+
+/// Alpha lists must be non-empty with every value strictly inside (0, 1);
+/// XGBoost rejects values outside that range at configure time, but with a
+/// far less direct error message.
+fn validate_alphas(alphas: &[f32], name: &str) -> Result<(), String> {
+    if alphas.is_empty() {
+        return Err(format!("{} must contain at least one value", name));
+    }
+    for a in alphas {
+        if !(*a > 0.0 && *a < 1.0) {
+            return Err(format!("{} values must be in (0, 1), got {}", name, a));
+        }
+    }
+    Ok(())
 }

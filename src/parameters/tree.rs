@@ -7,23 +7,25 @@ use super::Interval;
 
 /// The tree construction algorithm used in XGBoost (see description in the
 /// [reference paper](http://arxiv.org/abs/1603.02754)).
-///
-/// Distributed and external memory version only support approximate algorithm.
 #[derive(Clone, Default)]
 pub enum TreeMethod {
-    /// Use heuristic to choose faster one.
-    ///
-    /// * For small to medium dataset, exact greedy will be used.
-    /// * For very large-dataset, approximate algorithm will be chosen.
-    /// * Because old behavior is always use exact greedy in single machine, user will get a message when
-    ///   approximate algorithm is chosen to notify this choice.
+    /// Resolves to [`Hist`](TreeMethod::Hist) (since XGBoost 2.0; the bundled
+    /// 3.3 dispatches `auto` straight to the quantile histogram updater).
+    /// There is no small-data heuristic anymore — `auto` and `hist` are the
+    /// same fast method.
     #[default]
     Auto,
 
-    /// Exact greedy algorithm.
+    /// Exact greedy algorithm. Legacy: enumerates every split candidate, is
+    /// easily 5-10x slower than `hist` on wide data, and does not support
+    /// `QuantileDMatrix` or categorical features. Prefer
+    /// [`Hist`](TreeMethod::Hist) (or the default) unless you specifically
+    /// need exact split enumeration.
     Exact,
 
-    /// Approximate greedy algorithm using sketching and histogram.
+    /// Approximate greedy algorithm using sketching and histogram, re-sketched
+    /// per iteration. Mainly useful for distributed setups; `hist` is faster
+    /// for single-machine training.
     Approx,
 
     /// Fast histogram optimized approximate greedy algorithm. It uses some performance improvements
@@ -62,11 +64,49 @@ impl<'a> From<&'a str> for TreeMethod {
             "hist" => TreeMethod::Hist,
             // Compat shim: XGBoost 2.0 removed the gpu_* tree methods (GPU
             // selection moved to the `device` parameter); map to the CPU
-            // spellings rather than emitting strings XGBoost 3.x rejects.
-            "gpu_exact" => TreeMethod::Exact,
-            "gpu_hist" => TreeMethod::Hist,
+            // spellings rather than emitting strings XGBoost 3.x rejects —
+            // but loudly, because the mapping alone lands on the CPU.
+            "gpu_exact" | "gpu_hist" => {
+                log::warn!(
+                    "tree_method '{s}' was removed in XGBoost 2.0; mapping to the CPU '{}' method. \
+                     For GPU training set BoosterParameters' device to Device::Cuda instead.",
+                    if s == "gpu_exact" { "exact" } else { "hist" }
+                );
+                if s == "gpu_exact" {
+                    TreeMethod::Exact
+                } else {
+                    TreeMethod::Hist
+                }
+            }
             _ => panic!("no known tree_method for {}", s),
         }
+    }
+}
+
+/// Sampling method for the training instances (XGBoost `sampling_method`).
+///
+/// Only used when `subsample < 1.0`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum SamplingMethod {
+    /// Each row has equal probability of being selected (XGBoost default).
+    /// Works on any device.
+    #[default]
+    Uniform,
+
+    /// Rows are selected with probability proportional to the regularized
+    /// absolute gradient. Lets `subsample` go as low as ~0.1 without accuracy
+    /// loss — a large training speedup — but **requires `device=cuda` with
+    /// `tree_method=hist`**; the CPU updaters reject it.
+    GradientBased,
+}
+
+impl std::fmt::Display for SamplingMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let result = match *self {
+            SamplingMethod::Uniform => "uniform",
+            SamplingMethod::GradientBased => "gradient_based",
+        };
+        write!(f, "{}", result)
     }
 }
 
@@ -290,6 +330,30 @@ pub struct TreeBoosterParameters {
     ///
     /// * default: 1
     num_parallel_tree: u32,
+
+    /// Sampling method used when `subsample < 1.0`. `GradientBased` permits
+    /// much lower subsample ratios (~0.1) without accuracy loss but requires
+    /// `device=cuda` + `tree_method=hist`.
+    ///
+    /// * default: SamplingMethod::Uniform
+    sampling_method: SamplingMethod,
+
+    /// Maximum number of categories for which one-hot encoded splits are used;
+    /// categorical features with more categories use partition-based splits.
+    /// Only relevant for columns marked categorical (see
+    /// `DMatrix::set_feature_types`).
+    ///
+    /// * range: [1,∞], XGBoost default: 4
+    /// * default: `None` (let XGBoost decide)
+    max_cat_to_onehot: Option<u32>,
+
+    /// Maximum number of categories considered per partition-based categorical
+    /// split. Lower values are faster and regularize more; higher values find
+    /// better splits on high-cardinality categorical features.
+    ///
+    /// * range: [1,∞], XGBoost default: 64
+    /// * default: `None` (let XGBoost decide)
+    max_cat_threshold: Option<u32>,
 }
 
 impl Default for TreeBoosterParameters {
@@ -315,6 +379,9 @@ impl Default for TreeBoosterParameters {
             max_leaves: 0,
             max_bin: 256,
             num_parallel_tree: 1,
+            sampling_method: SamplingMethod::default(),
+            max_cat_to_onehot: None,
+            max_cat_threshold: None,
         }
     }
 }
@@ -359,6 +426,18 @@ impl TreeBoosterParameters {
             ));
         }
 
+        // Emitted only when non-default: `gradient_based` is rejected by the
+        // CPU updaters, so an unconditional emit would break CPU training.
+        if self.sampling_method != SamplingMethod::Uniform {
+            v.push(("sampling_method".to_owned(), self.sampling_method.to_string()));
+        }
+        if let Some(n) = self.max_cat_to_onehot {
+            v.push(("max_cat_to_onehot".to_owned(), n.to_string()));
+        }
+        if let Some(n) = self.max_cat_threshold {
+            v.push(("max_cat_threshold".to_owned(), n.to_string()));
+        }
+
         v
     }
 }
@@ -370,6 +449,14 @@ impl TreeBoosterParametersBuilder {
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bytree, "colsample_bytree")?;
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bylevel, "colsample_bylevel")?;
         Interval::new_open_closed(0.0, 1.0).validate(&self.colsample_bynode, "colsample_bynode")?;
+        // The C++ side enforces a lower bound of 1 on both; fail here with a
+        // direct message instead of an opaque configure-time CHECK.
+        if let Some(Some(0)) = self.max_cat_to_onehot {
+            return Err("max_cat_to_onehot must be >= 1".to_owned());
+        }
+        if let Some(Some(0)) = self.max_cat_threshold {
+            return Err("max_cat_threshold must be >= 1".to_owned());
+        }
         Ok(())
     }
 }

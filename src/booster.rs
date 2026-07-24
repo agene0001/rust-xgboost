@@ -207,6 +207,11 @@ pub struct Booster {
     /// ~18% of single-row inplace predict latency on a single-thread booster.
     /// `Booster` is `!Sync` (raw handle field), so `&self` calls cannot race on it.
     inplace_proxy: std::cell::OnceCell<xgboost_sys::DMatrixHandle>,
+    /// Inplace-prediction config with a custom missing value, built once by
+    /// [`set_inplace_predict_missing`](Self::set_inplace_predict_missing).
+    /// `None` means the static NaN config — the hot path stays allocation-free
+    /// either way.
+    inplace_config: Option<ffi::CString>,
 }
 
 // SAFETY: a `BoosterHandle` has no thread affinity. All C-API return buffers
@@ -228,7 +233,39 @@ impl Booster {
         Booster {
             handle,
             inplace_proxy: std::cell::OnceCell::new(),
+            inplace_config: None,
         }
+    }
+
+    /// Set the value the inplace prediction paths (`predict_from_dense*`,
+    /// `predict_from_csr*`) treat as missing, instead of the default NaN.
+    ///
+    /// For serving inputs that encode missing as a sentinel (e.g. `0.0` or
+    /// `-999.0`), this avoids rewriting each row to NaN before predicting. The
+    /// config string is built once here (one small allocation); the per-call
+    /// hot path remains allocation-free. Pass NaN to restore the default.
+    /// `missing` must be finite or NaN. Does not affect the DMatrix-based
+    /// predict paths — a `DMatrix` applies its own missing value at
+    /// construction (see `DMatrix::from_dense_with_missing`).
+    pub fn set_inplace_predict_missing(&mut self, missing: f32) -> XGBResult<()> {
+        if missing.is_nan() {
+            self.inplace_config = None;
+            return Ok(());
+        }
+        let json = format!(
+            r#"{{"type":0,"training":false,"iteration_begin":0,"iteration_end":0,"strict_shape":false,"missing":{}}}"#,
+            crate::dmatrix::missing_json(missing)?
+        );
+        self.inplace_config = Some(ffi::CString::new(json).expect("JSON built above contains no interior NUL"));
+        Ok(())
+    }
+
+    /// Config used by the inplace prediction paths: the custom-missing config
+    /// when set, else the static NaN one.
+    fn inplace_config(&self) -> &ffi::CStr {
+        self.inplace_config
+            .as_deref()
+            .unwrap_or(predict_config::NORMAL_INPLACE)
     }
 
     /// Get the cached proxy DMatrix for inplace prediction, creating it on first use.
@@ -393,6 +430,11 @@ impl Booster {
         };
 
         let mut bst = Booster::new_with_cached_dmats(&params.booster_params, &cached_dmats)?;
+        // Each evaluation is a full prediction pass per eval set; honor the
+        // configured cadence (always evaluating the final round so training
+        // never ends without a metric). 0 is documented as meaning 1.
+        let eval_period = params.eval_period.max(1) as i32;
+        let last_round = params.boost_rounds as i32 - 1;
         for i in 0..params.boost_rounds as i32 {
             debug!("Updating in round: {}", i);
             if let Some(objective_fn) = params.custom_objective_fn {
@@ -401,8 +443,10 @@ impl Booster {
                 bst.update(params.dtrain, i)?;
             }
 
-            // Collect evaluation results if evaluation sets are provided
-            let evaluation_results = if let Some(eval_sets) = params.evaluation_sets {
+            // Collect evaluation results if evaluation sets are provided and
+            // this round is on the evaluation schedule
+            let eval_this_round = i % eval_period == 0 || i == last_round;
+            let evaluation_results = if let Some(eval_sets) = params.evaluation_sets.filter(|_| eval_this_round) {
                 let mut dmat_eval_results = bst.eval_set(eval_sets, i)?;
 
                 if let Some(eval_fn) = params.custom_evaluation_fn {
@@ -419,24 +463,26 @@ impl Booster {
                     }
                 }
 
-                // convert to map of eval_name -> (dmat_name -> score)
-                let mut eval_dmat_results = BTreeMap::new();
-                for (dmat_name, eval_results) in &dmat_eval_results {
-                    for (eval_name, result) in eval_results {
-                        let dmat_results = eval_dmat_results.entry(eval_name).or_insert_with(BTreeMap::new);
-                        dmat_results.insert(dmat_name, result);
+                if params.verbose_eval {
+                    // convert to map of eval_name -> (dmat_name -> score)
+                    let mut eval_dmat_results = BTreeMap::new();
+                    for (dmat_name, eval_results) in &dmat_eval_results {
+                        for (eval_name, result) in eval_results {
+                            let dmat_results = eval_dmat_results.entry(eval_name).or_insert_with(BTreeMap::new);
+                            dmat_results.insert(dmat_name, result);
+                        }
                     }
-                }
 
-                // Build the line once and emit it with a single write, instead of
-                // taking the stdout lock several times per boosting round.
-                let mut line = format!("[{}]", i);
-                for (eval_name, dmat_results) in eval_dmat_results {
-                    for (dmat_name, result) in dmat_results {
-                        let _ = write!(line, "\t{}-{}:{}", dmat_name, eval_name, result);
+                    // Build the line once and emit it with a single write, instead
+                    // of taking the stdout lock several times per boosting round.
+                    let mut line = format!("[{}]", i);
+                    for (eval_name, dmat_results) in eval_dmat_results {
+                        for (dmat_name, result) in dmat_results {
+                            let _ = write!(line, "\t{}-{}:{}", dmat_name, eval_name, result);
+                        }
                     }
+                    println!("{}", line);
                 }
-                println!("{}", line);
 
                 Some(dmat_eval_results)
             } else {
@@ -694,27 +740,23 @@ impl Booster {
         self.get_feature_info("feature_name")
     }
 
-    /// Get the number of feature names stored in this model without allocating the names.
+    /// Get the number of features this model was configured for.
     ///
-    /// Used on hot paths (e.g. per-iteration validation) where only the count is needed.
-    fn num_feature_names(&self) -> XGBResult<usize> {
-        let mut out_len = 0;
-        let mut out = ptr::null_mut();
-        let field = c"feature_name";
-        xgb_call!(xgboost_sys::XGBoosterGetStrFeatureInfo(
-            self.handle,
-            field.as_ptr(),
-            &mut out_len,
-            &mut out
-        ))?;
-        Ok(out_len as usize)
+    /// Uses `XGBoosterGetNumFeature` directly rather than counting feature
+    /// *names*: it is valid for models that never had names attached, and
+    /// avoids materializing the name array on per-iteration paths.
+    fn num_features(&self) -> XGBResult<usize> {
+        let mut out: xgboost_sys::bst_ulong = 0;
+        xgb_call!(xgboost_sys::XGBoosterGetNumFeature(self.handle, &mut out))?;
+        Ok(out as usize)
     }
 
     /// Get names of features stored in this model.
     pub fn get_feature_info(&self, field: &str) -> XGBResult<Vec<String>> {
         let mut out_len = 0;
         let mut out = ptr::null_mut();
-        let field: ffi::CString = ffi::CString::new(field).unwrap();
+        let field: ffi::CString =
+            ffi::CString::new(field).map_err(|_| XGBError::new("field contains an interior NUL byte"))?;
         xgb_call!(xgboost_sys::XGBoosterGetStrFeatureInfo(
             self.handle,
             field.as_ptr(),
@@ -723,11 +765,16 @@ impl Booster {
         ))?;
         if out_len > 0 {
             let out_ptr_slice = unsafe { slice::from_raw_parts(out, out_len as usize) };
-            let out_vec = out_ptr_slice
+            out_ptr_slice
                 .iter()
-                .map(|str_ptr| unsafe { ffi::CStr::from_ptr(*str_ptr).to_str().unwrap().to_owned() })
-                .collect();
-            Ok(out_vec)
+                .map(|str_ptr| {
+                    unsafe { ffi::CStr::from_ptr(*str_ptr) }
+                        .to_str()
+                        .map(str::to_owned)
+                        // Possible on a model saved by another binding.
+                        .map_err(|e| XGBError::new(format!("feature info value is not valid UTF-8: {e}")))
+                })
+                .collect()
         } else {
             Ok(Vec::new())
         }
@@ -741,12 +788,19 @@ impl Booster {
     /// Set names of features stored in this model.
     #[allow(clippy::unnecessary_cast)]
     pub fn set_feature_info(&self, field: &str, features: &Vec<&str>) -> XGBResult<()> {
-        let field: ffi::CString = ffi::CString::new(field).unwrap();
+        let field: ffi::CString =
+            ffi::CString::new(field).map_err(|_| XGBError::new("field contains an interior NUL byte"))?;
 
         // We want zero terminated strings. Keep the owned `CString`s alive in
         // `c_temp_features` for the duration of the FFI call so the pointers in
         // `c_feature_ptr` remain valid; they are dropped (and freed) on return.
-        let c_temp_features: Vec<ffi::CString> = features.iter().map(|s| ffi::CString::new(*s).unwrap()).collect();
+        let c_temp_features: Vec<ffi::CString> = features
+            .iter()
+            .map(|s| {
+                ffi::CString::new(*s)
+                    .map_err(|_| XGBError::new(format!("feature info value contains an interior NUL byte: {s:?}")))
+            })
+            .collect::<XGBResult<_>>()?;
         let mut c_feature_ptr: Vec<*const raw::c_char> = c_temp_features
             .iter()
             .map(|s| s.as_ptr() as *const raw::c_char)
@@ -760,15 +814,17 @@ impl Booster {
         ))
     }
 
-    /// Validate that the feature names in this booster are compatible with the given DMatrix.
+    /// Validate that this booster's feature count is compatible with the given DMatrix.
     ///
-    /// If the booster has feature names set, this checks that the number of features matches
-    /// the number of columns in the DMatrix. If no feature names are set, this is a no-op.
-    /// If the DMatrix has 0 columns (unknown dimensions from CSR/CSC sparse matrices), validation is skipped.
+    /// Checks the model's configured feature count against the number of columns in the
+    /// DMatrix. Skipped when the count is unavailable (e.g. a booster created without
+    /// cached DMatrices before its first update) or zero, and when the DMatrix has
+    /// 0 columns (unknown dimensions from CSR/CSC sparse matrices).
     fn validate_features(&self, dmat: &DMatrix) -> XGBResult<()> {
-        let num_features = self.num_feature_names()?;
+        // Best-effort: an error here means the model has no feature count yet,
+        // not that the inputs mismatch — let the real operation proceed.
+        let num_features = self.num_features().unwrap_or(0);
         if num_features == 0 {
-            // No feature names set, nothing to validate
             return Ok(());
         }
 
@@ -780,7 +836,7 @@ impl Booster {
 
         if num_features != num_cols {
             return Err(XGBError::new(format!(
-                "Feature names mismatch: booster has {} features but DMatrix has {} columns",
+                "Feature count mismatch: booster has {} features but DMatrix has {} columns",
                 num_features, num_cols
             )));
         }
@@ -794,11 +850,17 @@ impl Booster {
     /// Returns an array containing one entry per row in the given data and its shape as array.
     pub fn predict_matrix(&self, dmat: &DMatrix, config_json: &str) -> XGBResult<(Vec<f32>, Vec<u64>)> {
         let str_buffer: ffi::CString;
-        let cfg = if !config_json.is_empty() && config_json.ends_with('\u{0}') {
-            unsafe { ffi::CStr::from_ptr(config_json.as_ptr() as *const raw::c_char) }
-        } else {
-            str_buffer = ffi::CString::new(config_json).unwrap();
-            str_buffer.as_c_str()
+        // from_bytes_with_nul (unlike a trailing-NUL check + from_ptr) rejects
+        // interior NULs instead of silently truncating the config at the first
+        // one; a string that merely lacks the trailing NUL falls through to the
+        // allocating path, which reports interior NULs as an error.
+        let cfg = match ffi::CStr::from_bytes_with_nul(config_json.as_bytes()) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                str_buffer = ffi::CString::new(config_json)
+                    .map_err(|_| XGBError::new("config_json contains an interior NUL byte"))?;
+                str_buffer.as_c_str()
+            }
         };
         let (data, shape) = self.predict_raw(dmat, cfg)?;
         Ok((data.to_vec(), shape.to_vec()))
@@ -889,7 +951,7 @@ impl Booster {
         xgb_call!(xgboost_sys::XGBoosterPredictFromDense(
             self.handle,
             values_cstr.as_ptr(),
-            predict_config::NORMAL_INPLACE.as_ptr(),
+            self.inplace_config().as_ptr(),
             self.inplace_proxy()?,
             &mut out_shape,
             &mut out_shape_dim,
@@ -969,7 +1031,7 @@ impl Booster {
             indices_cstr.as_ptr(),
             data_cstr.as_ptr(),
             num_cols as xgboost_sys::bst_ulong,
-            predict_config::NORMAL_INPLACE.as_ptr(),
+            self.inplace_config().as_ptr(),
             self.inplace_proxy()?,
             &mut out_shape,
             &mut out_shape_dim,
@@ -980,7 +1042,11 @@ impl Booster {
 
     /// Predict results for given data.
     ///
-    /// Returns an array containing one entry per row in the given data.
+    /// Returns an array containing one entry per row in the given data for
+    /// single-output models. Multi-output models (multiclass softprob,
+    /// multi-quantile/expectile, multi-target) return `num_rows * n_outputs`
+    /// entries in row-major order — e.g. one column per alpha for
+    /// [`RegQuantile`](crate::parameters::learning::Objective::RegQuantile).
     pub fn predict(&self, dmat: &DMatrix) -> XGBResult<Vec<f32>> {
         Ok(self.predict_borrowed(dmat)?.to_vec())
     }
@@ -992,7 +1058,9 @@ impl Booster {
     /// [`predict_from_dense_into`](Self::predict_from_dense_into): reusing one
     /// buffer across calls makes a steady-state batch-scoring loop
     /// allocation-free on the Rust side. The output length is
-    /// `num_rows * n_groups` (`n_groups` is 1 for regression/binary models).
+    /// `num_rows * n_outputs` (`n_outputs` is 1 for single-output regression/
+    /// binary models, the class count for softprob, the alpha count for
+    /// multi-quantile/expectile).
     pub fn predict_into(&self, dmat: &DMatrix, out: &mut Vec<f32>) -> XGBResult<()> {
         let data = self.predict_borrowed(dmat)?;
         out.clear();
@@ -2154,6 +2222,52 @@ mod tests {
         let (again, shape_again) = bst.predict_from_dense(&data, num_rows).unwrap();
         assert_eq!(shape_again, shape);
         assert_eq!(again, via_inplace);
+    }
+
+    #[test]
+    fn inplace_predict_missing_sentinel_matches_nan() {
+        let (num_rows, num_cols) = (256, 8);
+        let (data, labels) = synthetic_dense(num_rows, num_cols);
+
+        let mut dm = DMatrix::from_dense(&data, num_rows).unwrap();
+        dm.set_labels(&labels).unwrap();
+        let mut bst = Booster::new_with_cached_dmats(&hist_binary_params(256), &[&dm]).unwrap();
+        for i in 0..10 {
+            bst.update(&dm, i).unwrap();
+        }
+
+        // A row with a genuinely missing feature, encoded both ways.
+        let mut row_nan = data[..num_cols].to_vec();
+        row_nan[3] = f32::NAN;
+        let mut row_sentinel = data[..num_cols].to_vec();
+        row_sentinel[3] = -999.0;
+
+        let (expected, _) = bst.predict_from_dense(&row_nan, 1).unwrap();
+
+        // Without the custom missing value, -999 is an ordinary feature value
+        // and (for this model/row) should not match the NaN prediction. Guard
+        // against a vacuous test where the tree never splits on feature 3.
+        let (as_value, _) = bst.predict_from_dense(&row_sentinel, 1).unwrap();
+
+        bst.set_inplace_predict_missing(-999.0).unwrap();
+        let (as_missing, _) = bst.predict_from_dense(&row_sentinel, 1).unwrap();
+        assert_eq!(
+            as_missing, expected,
+            "sentinel-encoded missing must predict identically to NaN-encoded"
+        );
+        if as_value != expected {
+            // The interesting case: the sentinel actually changed the path,
+            // proving the config took effect rather than being ignored.
+            assert_ne!(as_missing, as_value);
+        }
+
+        // NaN restores the default config (and the static-config path).
+        bst.set_inplace_predict_missing(f32::NAN).unwrap();
+        let (restored, _) = bst.predict_from_dense(&row_nan, 1).unwrap();
+        assert_eq!(restored, expected);
+
+        // Infinity is rejected, matching the DMatrix constructors.
+        assert!(bst.set_inplace_predict_missing(f32::INFINITY).is_err());
     }
 
     #[test]
