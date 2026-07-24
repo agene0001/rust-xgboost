@@ -90,15 +90,14 @@ fn main() {
     {
         // compile XGBOOST with cmake (and ninja, when available)
 
-        // Rebuild the C++ when the bundled XGBoost version changes. Without
-        // this, checking out a new submodule tag silently reuses the previous
-        // version's cached libxgboost (cargo only reruns build scripts on
-        // watched-path changes). The version header changes on exactly every
-        // release bump, so it is a cheap, reliable proxy for "submodule moved".
-        println!(
-            "cargo:rerun-if-changed={}",
-            xgb_root.join("include/xgboost/version_config.h").display()
-        );
+        // Rebuild the C++ when the bundled sources change. Watching only
+        // version_config.h (the old approach) caught submodule version bumps
+        // but silently measured stale code after hand-edits to the carried
+        // patches — a rerun here only triggers an incremental cmake build, so
+        // watching the whole tree is cheap. dmlc-core is deliberately not
+        // watched (never patched here; 0.25% of the hot path).
+        println!("cargo:rerun-if-changed={}", xgb_root.join("src").display());
+        println!("cargo:rerun-if-changed={}", xgb_root.join("include").display());
 
         // CMake
         let mut dst = cmake::Config::new(&xgb_root);
@@ -112,14 +111,17 @@ fn main() {
         // RelWithDebInfo's -O2 leaves performance on the table in the hot loops.
         let dst = dst.define("CMAKE_BUILD_TYPE", "Release");
 
-        // Opt-in performance flags for the libxgboost build, off by default so
-        // the produced binaries stay portable across CPUs of the architecture.
-        //
-        // XGB_BUILD_NATIVE=1 tunes codegen for the build machine. Only valid
-        // when the binary runs where it was built (clang spells the flag
-        // -mcpu=native on aarch64 and -march=native elsewhere).
+        // XGB_BUILD_NATIVE tunes codegen for the build machine (clang spells
+        // the flag -mcpu=native on aarch64 and -march=native elsewhere).
+        // Default ON: local_build compiles on the machine that will run the
+        // binary, so "portable across CPUs" protects nobody by default while
+        // making every default build (and every benchmark that forgets the
+        // env var) measure the slow path. Cross-machine deploys of a locally
+        // built artifact are the exception and opt out with XGB_BUILD_NATIVE=0.
+        // The distributed release assets are unaffected — release-libs.yml
+        // invokes cmake directly and never runs this script.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_NATIVE");
-        if env::var("XGB_BUILD_NATIVE").is_ok_and(|v| v == "1") {
+        if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") {
             let flag = if target.contains("aarch64") {
                 "-mcpu=native"
             } else {
@@ -138,6 +140,34 @@ fn main() {
             "OFF"
         };
         let dst = dst.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", ipo);
+
+        // Hide non-API symbols in the shared library. The C API keeps its
+        // explicit __attribute__((visibility("default"))) (c_api.h XGB_DLL),
+        // so the Rust link is unaffected; what this buys is that cross-TU
+        // calls inside libxgboost.so stop being interposable on Linux ELF
+        // (no PLT indirection), plus a smaller export table everywhere.
+        let dst = dst.define("HIDE_CXX_SYMBOLS", "ON");
+
+        // Escape hatch for perf experiments: XGB_CMAKE_DEFINES="A=1;B=OFF"
+        // passes arbitrary -D defines to the bundled build (e.g.
+        // USE_OPENMP=OFF, BUILD_STATIC_LIB=ON) without editing this script.
+        // Caveat: -D values persist in CMakeCache.txt, so REMOVING an entry
+        // does not restore the default — set it explicitly (e.g. USE_OPENMP=ON)
+        // or delete the cmake build dir under OUT_DIR.
+        println!("cargo:rerun-if-env-changed=XGB_CMAKE_DEFINES");
+        if let Ok(defines) = env::var("XGB_CMAKE_DEFINES") {
+            for def in defines.split(';').filter(|d| !d.trim().is_empty()) {
+                match def.split_once('=') {
+                    Some((key, val)) => {
+                        dst.define(key.trim(), val.trim());
+                    }
+                    None => panic!(
+                        "XGB_CMAKE_DEFINES entry {def:?} is not KEY=VALUE \
+                         (full value: {defines:?})"
+                    ),
+                }
+            }
+        }
 
         #[cfg(feature = "cuda")]
         let mut dst = dst
