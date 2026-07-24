@@ -148,6 +148,18 @@ fn main() {
         // (no PLT indirection), plus a smaller export table everywhere.
         let dst = dst.define("HIDE_CXX_SYMBOLS", "ON");
 
+        // Keep every build artifact inside cmake's per-OUT_DIR binary dir.
+        // Upstream's default links the shared library into the SOURCE tree
+        // (<xgboost>/lib) — a single location shared by every profile and
+        // every concurrent cargo invocation using this checkout, so two
+        // builds racing through the ninja link step fail with
+        // "LNK1104: cannot open file ...xgboost.dll" (observed with a
+        // background `cargo build` overlapping `cargo run --profile
+        // production` right after a pin bump). With this ON the link output
+        // stays under OUT_DIR; the install step still places the library in
+        // <dst>/bin|lib, where the staging candidates below pick it up.
+        let dst = dst.define("KEEP_BUILD_ARTIFACTS_IN_BINARY_DIR", "ON");
+
         // Escape hatch for perf experiments: XGB_CMAKE_DEFINES="A=1;B=OFF"
         // passes arbitrary -D defines to the bundled build (e.g.
         // USE_OPENMP=OFF, BUILD_STATIC_LIB=ON) without editing this script.
