@@ -263,9 +263,7 @@ impl Booster {
     /// Config used by the inplace prediction paths: the custom-missing config
     /// when set, else the static NaN one.
     fn inplace_config(&self) -> &ffi::CStr {
-        self.inplace_config
-            .as_deref()
-            .unwrap_or(predict_config::NORMAL_INPLACE)
+        self.inplace_config.as_deref().unwrap_or(predict_config::NORMAL_INPLACE)
     }
 
     /// Get the cached proxy DMatrix for inplace prediction, creating it on first use.
@@ -1682,7 +1680,9 @@ mod tests {
                 .unwrap();
             let mut booster = Booster::new_with_cached_dmats(&params, &[&dmat_train]).unwrap();
             for i in 0..3 {
-                booster.update(&dmat_train, i).expect("deprecated booster type failed to train");
+                booster
+                    .update(&dmat_train, i)
+                    .expect("deprecated booster type failed to train");
             }
             let preds = booster.predict(&dmat_train).unwrap();
             assert_eq!(preds.len(), dmat_train.num_rows());

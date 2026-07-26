@@ -42,7 +42,9 @@ pub(crate) fn validate_missing(missing: f32) -> XGBResult<()> {
     if missing.is_nan() || missing.is_finite() {
         Ok(())
     } else {
-        Err(XGBError::new(format!("missing value must be finite or NaN, got {missing}")))
+        Err(XGBError::new(format!(
+            "missing value must be finite or NaN, got {missing}"
+        )))
     }
 }
 
@@ -50,11 +52,7 @@ pub(crate) fn validate_missing(missing: f32) -> XGBResult<()> {
 /// (`NaN` for NaN — the same spelling the static configs use).
 pub(crate) fn missing_json(missing: f32) -> XGBResult<String> {
     validate_missing(missing)?;
-    Ok(if missing.is_nan() {
-        "NaN".to_owned()
-    } else {
-        missing.to_string()
-    })
+    Ok(if missing.is_nan() { "NaN".to_owned() } else { missing.to_string() })
 }
 
 /// Build the `XGDMatrixCreateFromCSR`/`CSC` ingestion config.
@@ -1131,7 +1129,8 @@ mod tests {
         // preserve the shape.
         let eval_rows = 10;
         let eval_data = &data[..eval_rows * num_cols];
-        let eval = DMatrix::from_dense_quantile_ref(eval_data, eval_rows, Some(&labels[..eval_rows]), 64, &train).unwrap();
+        let eval =
+            DMatrix::from_dense_quantile_ref(eval_data, eval_rows, Some(&labels[..eval_rows]), 64, &train).unwrap();
         assert_eq!(eval.shape(), (eval_rows, num_cols));
         assert_eq!(eval.get_labels().unwrap(), &labels[..eval_rows]);
 

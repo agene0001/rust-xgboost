@@ -72,11 +72,7 @@ impl<'a> From<&'a str> for TreeMethod {
                      For GPU training set BoosterParameters' device to Device::Cuda instead.",
                     if s == "gpu_exact" { "exact" } else { "hist" }
                 );
-                if s == "gpu_exact" {
-                    TreeMethod::Exact
-                } else {
-                    TreeMethod::Hist
-                }
+                if s == "gpu_exact" { TreeMethod::Exact } else { TreeMethod::Hist }
             }
             _ => panic!("no known tree_method for {}", s),
         }

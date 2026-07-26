@@ -110,7 +110,9 @@ fn params(o: &Opts) -> parameters::BoosterParameters {
         .eta(0.3);
     if let Some(max_leaves) = o.max_leaves {
         // max_depth 0 = unlimited: let max_leaves alone bound lossguide trees.
-        b.grow_policy(tree::GrowPolicy::LossGuide).max_leaves(max_leaves).max_depth(0);
+        b.grow_policy(tree::GrowPolicy::LossGuide)
+            .max_leaves(max_leaves)
+            .max_depth(0);
     }
     let tree_params = b.build().unwrap();
     let learning_params = learning::LearningTaskParametersBuilder::default()

@@ -314,34 +314,26 @@ fn bench_serving_single_thread(c: &mut Criterion) {
         });
 
         // Steady-state buffer reuse: one output Vec kept across iterations.
-        group.bench_with_input(
-            BenchmarkId::new("predict_from_dense_into", &label),
-            &data,
-            |b, data| {
-                let mut out = Vec::new();
-                b.iter(|| {
-                    booster
-                        .predict_from_dense_into(black_box(data), num_rows, &mut out)
-                        .unwrap();
-                    black_box(&out);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("predict_from_dense_into", &label), &data, |b, data| {
+            let mut out = Vec::new();
+            b.iter(|| {
+                booster
+                    .predict_from_dense_into(black_box(data), num_rows, &mut out)
+                    .unwrap();
+                black_box(&out);
+            });
+        });
 
         let csr = (indptr, indices, values);
-        group.bench_with_input(
-            BenchmarkId::new("predict_from_csr", &label),
-            &csr,
-            |b, (ip, ix, v)| {
-                b.iter(|| {
-                    black_box(
-                        booster
-                            .predict_from_csr(black_box(ip), black_box(ix), black_box(v), num_features)
-                            .unwrap(),
-                    )
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("predict_from_csr", &label), &csr, |b, (ip, ix, v)| {
+            b.iter(|| {
+                black_box(
+                    booster
+                        .predict_from_csr(black_box(ip), black_box(ix), black_box(v), num_features)
+                        .unwrap(),
+                )
+            });
+        });
 
         group.bench_with_input(
             BenchmarkId::new("predict_from_csr_into", &label),
