@@ -2,17 +2,54 @@ use bindgen;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Primary source of prebuilt binaries: GitHub release assets built from the
-/// pinned submodule by `.github/workflows/release-libs.yml` (flat asset names,
-/// `<target>-<file>`). Bump the tag here together with the submodule.
+/// Repository publishing the prebuilt release assets (built from the pinned
+/// submodule by `.github/workflows/release-libs.yml`, flat `<target>-<file>`
+/// names).
 #[cfg(feature = "use_prebuilt_xgb")]
-const PREBUILT_RELEASE_URL: &str = "https://github.com/agene0001/rust-xgboost/releases/download/v3.3.0";
+const PREBUILT_RELEASE_REPO: &str = "https://github.com/agene0001/rust-xgboost";
 
 /// Fallback: XGBoost 3.0.0 binaries committed in the upstream fork's repo at its
-/// v3.0.1 tag. These are OLDER than the bundled headers (version skew), so a
-/// `cargo:warning` is emitted whenever they are used.
+/// v3.0.1 tag. These are OLDER than the bundled headers (version skew), so they
+/// are only used when explicitly opted into via `XGB_ALLOW_LEGACY_PREBUILT=1`.
 #[cfg(feature = "use_prebuilt_xgb")]
 const LEGACY_URL: &str = "https://github.com/marcomq/rust-xgboost/raw/refs/tags/v3.0.1/xgboost-sys/lib";
+
+/// Release-asset base URL for this crate version.
+///
+/// Derived from `CARGO_PKG_VERSION` rather than hardcoded so the tag cannot
+/// drift from the crate version: bumping the version in Cargo.toml
+/// automatically points at the matching release, and a release that was never
+/// published fails loudly in `fetch_lib` instead of silently falling back to
+/// version-skewed binaries.
+#[cfg(feature = "use_prebuilt_xgb")]
+fn prebuilt_release_url() -> String {
+    format!(
+        "{PREBUILT_RELEASE_REPO}/releases/download/v{}",
+        env::var("CARGO_PKG_VERSION").unwrap()
+    )
+}
+
+/// Version of the bundled XGBoost submodule, parsed from its `version_config.h`.
+fn bundled_xgboost_version(xgb_root: &Path) -> String {
+    let header = xgb_root.join("include").join("xgboost").join("version_config.h");
+    let text =
+        std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("cannot read {}: {e}", header.display()));
+    let field = |name: &str| -> u32 {
+        let needle = format!("#define {name} ");
+        text.lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix(&needle)?;
+                rest.split_whitespace().next()?.parse::<u32>().ok()
+            })
+            .unwrap_or_else(|| panic!("could not parse {name} from {}", header.display()))
+    };
+    format!(
+        "{}.{}.{}",
+        field("XGBOOST_VER_MAJOR"),
+        field("XGBOOST_VER_MINOR"),
+        field("XGBOOST_VER_PATCH")
+    )
+}
 
 fn main() {
     let target = env::var("TARGET").unwrap();
@@ -21,6 +58,25 @@ fn main() {
     // canonicalize produces and which breaks CMake's file(GLOB) (configure
     // fails with "No SOURCES given to target: xgboost").
     let xgb_root = dunce::canonicalize(Path::new("xgboost")).unwrap();
+
+    // This crate's version tracks the bundled XGBoost version, and the prebuilt
+    // release tag is derived from it (see `prebuilt_release_url`). Flag a
+    // submodule bump that forgot the Cargo.toml bump: under `use_prebuilt_xgb`
+    // it would point at the wrong release tag, and for `local_build` it makes
+    // the published crate version lie about what it bundles. Warn rather than
+    // panic so an intentional skew (e.g. a pre-release submodule pin, or a
+    // user-supplied XGBOOST_LIB_DIR) stays buildable; the release workflow
+    // enforces the invariant strictly before publishing assets.
+    let crate_version = env::var("CARGO_PKG_VERSION").unwrap();
+    let bundled_version = bundled_xgboost_version(&xgb_root);
+    if crate_version != bundled_version {
+        println!(
+            "cargo:warning=version skew: xgboost-sys is {crate_version} but the bundled submodule is \
+             XGBoost {bundled_version} (xgboost-sys/xgboost/include/xgboost/version_config.h). Bump \
+             `version` in Cargo.toml (and the root crate's) to {bundled_version}, then publish \
+             matching release assets with the `Release XGBoost binaries` workflow."
+        );
+    }
 
     let wrapper_h = xgb_root.join("include").join("xgboost").join("c_api.h");
     let bindings = bindgen::Builder::default()
@@ -275,20 +331,50 @@ fn stage_lib_next_to_exe(lib_src: &Path, out_dir: &str) {
 #[cfg(feature = "use_prebuilt_xgb")]
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Download one prebuilt library into `deps_path`, preferring this fork's
-/// release assets and falling back to the legacy (older) binaries with a
-/// warning when the release asset is unavailable.
+/// Download one prebuilt library into `deps_path` from this crate version's
+/// release assets.
+///
+/// A missing asset is a hard error rather than a silent downgrade. The legacy
+/// binaries are XGBoost 3.0.0 — older than the bundled headers — so linking
+/// them mixes ABIs and every API added since 3.0 fails at run time far from the
+/// cause (a missing v3.3.0 release surfaced as an "Unknown objective function:
+/// reg:expectileerror" test failure, not as a build error). Set
+/// `XGB_ALLOW_LEGACY_PREBUILT=1` to opt back into that fallback.
 #[cfg(feature = "use_prebuilt_xgb")]
 fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
     let dest = format!("{deps_path}/{file}");
-    let primary = format!("{PREBUILT_RELEASE_URL}/{target_dir}-{file}");
+    let release_url = prebuilt_release_url();
+    let primary = format!("{release_url}/{target_dir}-{file}");
     if web_copy(&primary, &dest).is_ok() {
         return Ok(());
     }
+
+    println!("cargo:rerun-if-env-changed=XGB_ALLOW_LEGACY_PREBUILT");
+    if !env::var("XGB_ALLOW_LEGACY_PREBUILT").is_ok_and(|v| v == "1") {
+        panic!(
+            "prebuilt asset is unavailable: {primary}\n\
+             \n\
+             The release for this crate version has not been published (the tag is derived from \
+             CARGO_PKG_VERSION = {version}). Fix by either:\n\
+             \n\
+             1. Publishing the assets: run the `Release XGBoost binaries` workflow\n\
+             \x20  (`gh workflow run release-libs.yml`) — it defaults to the tag this build\n\
+             \x20  expects, v{version}.\n\
+             2. Building libxgboost from the pinned submodule instead:\n\
+             \x20  `cargo build --features local_build` (this crate's default).\n\
+             3. Supplying your own libraries via XGBOOST_LIB_DIR.\n\
+             \n\
+             As a last resort, XGB_ALLOW_LEGACY_PREBUILT=1 falls back to XGBoost 3.0.0 binaries, \
+             which are version-skewed against the bundled {version} headers; expect missing \
+             symbols and unknown-parameter errors at run time.",
+            version = env::var("CARGO_PKG_VERSION").unwrap()
+        );
+    }
+
     println!(
-        "cargo:warning=prebuilt asset {primary} unavailable; falling back to legacy XGBoost 3.0.0 \
-         binaries, which are older than the bundled headers. Publish release assets via the \
-         release-libs workflow, or build from source with the local_build feature."
+        "cargo:warning=prebuilt asset {primary} unavailable; XGB_ALLOW_LEGACY_PREBUILT=1 is set, so \
+         falling back to legacy XGBoost 3.0.0 binaries. These are older than the bundled headers — \
+         APIs added since 3.0 will fail at run time."
     );
     web_copy(&format!("{LEGACY_URL}/{target_dir}/{file}"), &dest)
 }
