@@ -113,11 +113,13 @@ This is using a prebuilt shared library in xboost-sys/lib by default. You can al
 The library is looked up in the following order, so a build only reaches the network when it has to:
 
 1. `$XGBOOST_LIB_DIR` - link against an existing directory, nothing is copied or downloaded
-2. `$XGBOOST_LIB_CACHE`, defaulting to `$CARGO_HOME/xgboost-prebuilt/<tag>` - a download cache that
+2. `target/<profile>/deps/` - the copy an earlier build of this crate already put in place, reused
+   only if it still matches the pinned checksum
+3. `$XGBOOST_LIB_CACHE`, defaulting to `$CARGO_HOME/xgboost-prebuilt/<tag>` - a download cache that
    survives `cargo clean` and is shared between checkouts
-3. `xgboost-sys/lib/<platform>/` - the copies in this repository, present in a git checkout but not
+4. `xgboost-sys/lib/<platform>/` - the copies in this repository, present in a git checkout but not
    in the published crate
-4. Download, trying `$XGBOOST_LIB_URL` first if set, then the bundled mirrors in turn
+5. Download, trying `$XGBOOST_LIB_URL` first if set, then the bundled mirrors in turn
 
 Every file is pinned by SHA-256. A download that does not match, including an error page served
 during an outage, is rejected and the next source is tried. Files already on disk are re-checked on
@@ -126,9 +128,12 @@ subsequent build.
 
 To download from your own mirror, expose the files as `<base>/<platform>/<file>` and set:
 
-```
+```sh
 XGBOOST_LIB_URL=https://your-mirror.example/xgboost-libs
 ```
+
+A base URL containing `/releases/download/` is treated as a GitHub release instead, whose asset
+namespace is flat: the files are looked up as `<base>/<platform>-<file>`.
 
 For a fully offline build, either point `$XGBOOST_LIB_DIR` at a prepared directory, or place the
 files in `$XGBOOST_LIB_CACHE/<platform>/`.

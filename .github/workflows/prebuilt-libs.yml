@@ -47,4 +47,7 @@ jobs:
       - name: Upload and verify release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/upload-release-libs.sh "${{ inputs.tag }}"
+          # Via the environment, not an inline expansion: the value is attacker-controlled on a
+          # workflow_dispatch. Empty on a release event, which lets the script fall back to LIB_TAG.
+          TAG: ${{ inputs.tag }}
+        run: ./scripts/upload-release-libs.sh "$TAG"

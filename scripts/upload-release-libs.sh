@@ -142,16 +142,30 @@ gh release upload "$TAG" $(ls -d "$STAGE"/*) --clobber
 echo "Verifying published assets"
 BASE="https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$TAG"
 failed=0
+# A just-uploaded asset can 404 or briefly serve the previous bytes while the CDN catches up, so
+# retry before declaring a failure. Only a mismatch that survives every attempt is real.
+ATTEMPTS=3
 while read -r platform file sha; do
     url="$BASE/$platform-$file"
     tmp="$STAGE/.verify"
-    if ! curl -fsSL "$url" -o "$tmp"; then
-        echo "  FAILED   $platform-$file (download)" >&2
+    downloaded=false
+    actual=""
+    for attempt in $(seq 1 "$ATTEMPTS"); do
+        if [ "$attempt" -gt 1 ]; then
+            sleep $((attempt - 1))
+        fi
+        if curl -fsSL "$url" -o "$tmp"; then
+            downloaded=true
+            actual=$(sha256_of "$tmp")
+            if [ "$actual" = "$sha" ]; then
+                break
+            fi
+        fi
+    done
+    if [ "$downloaded" = false ]; then
+        echo "  FAILED   $platform-$file (download, $ATTEMPTS attempts)" >&2
         failed=1
-        continue
-    fi
-    actual=$(sha256_of "$tmp")
-    if [ "$actual" != "$sha" ]; then
+    elif [ "$actual" != "$sha" ]; then
         echo "  MISMATCH $platform-$file (served $actual)" >&2
         failed=1
     else

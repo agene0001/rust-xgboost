@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "use_prebuilt_xgb")]
 const LIB_TAG: &str = "v3.0.5";
 
-/// Base URLs tried in order when an artifact has to be downloaded. Each entry is expanded by
+/// Base URLs tried in order when an artifact has to be downloaded. `{tag}` is replaced with
+/// [`LIB_TAG`], so the tag is pinned in exactly one place. Each entry is expanded further by
 /// `mirror_url`, so a mirror may lay its files out either as `<base>/<platform>/<file>` or, for
 /// GitHub release assets, as `<base>/<platform>-<file>`.
 #[cfg(feature = "use_prebuilt_xgb")]
 const MIRRORS: &[&str] = &[
-    "https://github.com/marcomq/rust-xgboost/raw/refs/tags/v3.0.5/xgboost-sys/lib",
-    "https://github.com/marcomq/rust-xgboost/releases/download/v3.0.5",
+    "https://github.com/marcomq/rust-xgboost/raw/refs/tags/{tag}/xgboost-sys/lib",
+    "https://github.com/marcomq/rust-xgboost/releases/download/{tag}",
 ];
 
 fn main() {
@@ -226,14 +227,19 @@ fn provide_artifact(platform: &str, artifact: &Artifact, deps_path: &Path) -> Re
     if dest.exists() {
         if let Ok(bytes) = std::fs::read(&dest) {
             let actual = sha256_hex(&bytes);
-            // The stamp records what the file must hash to after `install_artifact` rewrote it.
-            if std::fs::read_to_string(stamp_path(&dest)).ok().as_deref() == Some(actual.as_str()) {
-                return Ok(());
+            // The stamp records the pinned hash and what the file must hash to after
+            // `install_artifact` rewrote it. Both have to match: the second catches corruption,
+            // the first catches a file left behind by a build that pinned a different version.
+            if let Ok(stamp) = std::fs::read_to_string(stamp_path(&dest)) {
+                let mut lines = stamp.lines();
+                if lines.next() == Some(artifact.sha256) && lines.next() == Some(actual.as_str()) {
+                    return Ok(());
+                }
             }
             if actual == artifact.sha256 {
                 // Intact, but left by a build that predates `install_artifact`. Finalize it in
                 // place rather than re-fetching bytes we already have.
-                install_artifact(&dest, &bytes)?;
+                install_artifact(&dest, &bytes, artifact.sha256)?;
                 return Ok(());
             }
         }
@@ -248,7 +254,7 @@ fn provide_artifact(platform: &str, artifact: &Artifact, deps_path: &Path) -> Re
         let src = dir.join(artifact.file);
         if let Ok(bytes) = std::fs::read(&src) {
             if sha256_hex(&bytes) == artifact.sha256 {
-                install_artifact(&dest, &bytes)?;
+                install_artifact(&dest, &bytes, artifact.sha256)?;
                 return Ok(());
             }
             println!("cargo:warning=ignoring {} (checksum mismatch)", src.display());
@@ -260,7 +266,7 @@ fn provide_artifact(platform: &str, artifact: &Artifact, deps_path: &Path) -> Re
         let url = mirror_url(&base, platform, artifact.file);
         match download_verified(&url, artifact.sha256) {
             Ok(bytes) => {
-                install_artifact(&dest, &bytes)?;
+                install_artifact(&dest, &bytes, artifact.sha256)?;
                 cache_store(platform, artifact.file, &bytes);
                 return Ok(());
             }
@@ -276,12 +282,13 @@ fn provide_artifact(platform: &str, artifact: &Artifact, deps_path: &Path) -> Re
 /// dylibs carry an absolute Homebrew path. Without this rewrite the pinned library is put in place
 /// and then ignored at run time in favour of whatever happens to sit at that path — which may be a
 /// different, ABI-incompatible XGBoost. Since the rewrite changes the file, its post-rewrite hash
-/// is stamped alongside so later builds can still tell intact from corrupt.
+/// is stamped alongside the pinned one, so later builds can tell an intact copy from a corrupt one
+/// and from one installed for a different pin.
 ///
 /// The new name is `dest` itself rather than an `@rpath` entry, because a `-sys` crate cannot add
 /// an rpath to the binaries of the packages that depend on it.
 #[cfg(feature = "use_prebuilt_xgb")]
-fn install_artifact(dest: &Path, bytes: &[u8]) -> Result<()> {
+fn install_artifact(dest: &Path, bytes: &[u8], expected_sha256: &str) -> Result<()> {
     write_atomic(dest, bytes)?;
     if cfg!(target_os = "macos") && dest.extension().is_some_and(|ext| ext == "dylib") {
         let status = std::process::Command::new("install_name_tool")
@@ -302,7 +309,8 @@ fn install_artifact(dest: &Path, bytes: &[u8]) -> Result<()> {
             return Err(format!("codesign failed for {}", dest.display()).into());
         }
     }
-    std::fs::write(stamp_path(dest), sha256_hex(&std::fs::read(dest)?))?;
+    let installed = sha256_hex(&std::fs::read(dest)?);
+    std::fs::write(stamp_path(dest), format!("{expected_sha256}\n{installed}\n"))?;
     Ok(())
 }
 
@@ -356,7 +364,7 @@ fn cache_store(platform: &str, file: &str, bytes: &[u8]) {
 #[cfg(feature = "use_prebuilt_xgb")]
 fn mirror_bases() -> Vec<String> {
     let mut bases: Vec<String> = std::env::var("XGBOOST_LIB_URL").into_iter().collect();
-    bases.extend(MIRRORS.iter().map(|m| m.to_string()));
+    bases.extend(MIRRORS.iter().map(|m| m.replace("{tag}", LIB_TAG)));
     bases
 }
 
@@ -420,7 +428,14 @@ fn download_verified(url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
 /// half-written library behind.
 #[cfg(feature = "use_prebuilt_xgb")]
 fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = dest.with_extension(format!("tmp{}", std::process::id()));
+    // Suffix the whole file name rather than replacing the extension: `xgboost.dll` and
+    // `xgboost.lib` would otherwise share a temporary path within one build.
+    let mut name = dest
+        .file_name()
+        .ok_or_else(|| format!("no file name in destination {}", dest.display()))?
+        .to_os_string();
+    name.push(format!(".tmp{}", std::process::id()));
+    let tmp = dest.with_file_name(name);
     std::fs::write(&tmp, bytes)?;
     if let Err(e) = std::fs::rename(&tmp, dest) {
         let _ = std::fs::remove_file(&tmp);
