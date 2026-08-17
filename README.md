@@ -110,6 +110,38 @@ Xgboost is kind of complicated to compile, especially when there is GPU support 
 It is sometimes easier to use a pre-build library. Therefore, the feature flag `use_prebuilt_xgb` is enabled by default.
 This is using a prebuilt shared library in xboost-sys/lib by default. You can also use a custom folder by defining `$XGBOOST_LIB_DIR`.
 
+The library is looked up in the following order, so a build only reaches the network when it has to:
+
+1. `$XGBOOST_LIB_DIR` - link against an existing directory, nothing is copied or downloaded
+2. `target/<profile>/deps/` - the copy an earlier build of this crate already put in place, reused
+   only if it still matches the pinned checksum
+3. `$XGBOOST_LIB_CACHE`, defaulting to `$CARGO_HOME/xgboost-prebuilt/<tag>` - a download cache that
+   survives `cargo clean` and is shared between checkouts
+4. `xgboost-sys/lib/<platform>/` - the copies in this repository, present in a git checkout but not
+   in the published crate
+5. Download, trying `$XGBOOST_LIB_URL` first if set, then the bundled mirrors in turn
+
+Every file is pinned by SHA-256. A download that does not match, including an error page served
+during an outage, is rejected and the next source is tried. Files already on disk are re-checked on
+each build, so a bad copy from an earlier build repairs itself rather than breaking every
+subsequent build.
+
+To download from your own mirror, expose the files as `<base>/<platform>/<file>` and set:
+
+```sh
+XGBOOST_LIB_URL=https://your-mirror.example/xgboost-libs
+```
+
+A base URL containing `/releases/download/` is treated as a GitHub release instead, whose asset
+namespace is flat: the files are looked up as `<base>/<platform>-<file>`.
+
+For a fully offline build, either point `$XGBOOST_LIB_DIR` at a prepared directory, or place the
+files in `$XGBOOST_LIB_CACHE/<platform>/`.
+
+On macOS the prebuilt dylib is stamped with an absolute Homebrew install name. The build rewrites
+it to the copy it just verified and re-signs it ad-hoc, so the pinned library is the one loaded at
+runtime rather than whatever Homebrew happens to have installed.
+
 If you prefer to use xgboost from homebrew, which may have GPU support, your can for example define
 ```
 XGBOOST_LIB_DIR=${HOMEBREW_PREFIX}/opt/xgboost/lib
