@@ -135,8 +135,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Version of the bundled XGBoost submodule, parsed from its `version_config.h`.
 fn bundled_xgboost_version(xgb_root: &Path) -> String {
     let header = xgb_root.join("include").join("xgboost").join("version_config.h");
-    let text =
-        std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("cannot read {}: {e}", header.display()));
+    let text = std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("cannot read {}: {e}", header.display()));
     let field = |name: &str| -> u32 {
         let needle = format!("#define {name} ");
         text.lines()
@@ -223,11 +222,7 @@ fn main() {
                 }
                 stage_lib_next_to_exe(Path::new(&format!("{deps_path}/libxgboost.dylib")), &out_dir);
             } else if cfg!(target_os = "linux") {
-                let target_dir = if cfg!(target_arch = "aarch64") {
-                    "linux_arm64"
-                } else {
-                    "linux_amd64"
-                };
+                let target_dir = if cfg!(target_arch = "aarch64") { "linux_arm64" } else { "linux_amd64" };
                 if !std::fs::exists(format!("{deps_path}/libxgboost.so")).unwrap() {
                     fetch_lib(target_dir, "libxgboost.so", &deps_path).unwrap();
                     fetch_lib(target_dir, "libdmlc.a", &deps_path).unwrap();
@@ -286,11 +281,7 @@ fn main() {
         // invokes cmake directly and never runs this script.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_NATIVE");
         if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") {
-            let flag = if target.contains("aarch64") {
-                "-mcpu=native"
-            } else {
-                "-march=native"
-            };
+            let flag = if target.contains("aarch64") { "-mcpu=native" } else { "-march=native" };
             dst.cflag(flag).cxxflag(flag);
         }
         // XGB_BUILD_IPO=1 enables link-time optimization (CMake IPO) for the
@@ -298,11 +289,7 @@ fn main() {
         // -D values persist in CMakeCache.txt across reconfigures, so an
         // explicit OFF is required for unsetting the env var to take effect.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_IPO");
-        let ipo = if env::var("XGB_BUILD_IPO").is_ok_and(|v| v == "1") {
-            "ON"
-        } else {
-            "OFF"
-        };
+        let ipo = if env::var("XGB_BUILD_IPO").is_ok_and(|v| v == "1") { "ON" } else { "OFF" };
         let dst = dst.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", ipo);
 
         // Hide non-API symbols in the shared library. The C API keeps its
