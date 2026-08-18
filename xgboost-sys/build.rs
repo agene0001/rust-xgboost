@@ -64,50 +64,14 @@ fn release_base_url() -> String {
 /// `XGB_REQUIRE_CHECKSUMS=1` turns that warning into an error, which is what CI
 /// should set.
 ///
-/// Recorded from the v3.3.0 release assets.
+/// Empty as of the 3.4.1 bump: the recorded digests were the v3.3.0 assets, and
+/// nothing has been published under v3.4.1 yet. Leaving 3.3.0's digests in place
+/// would have reported the first genuine v3.4.1 asset as a checksum mismatch,
+/// because the lookup keys on `(target_dir, file)` and carries no version. Every
+/// asset therefore downloads unverified with a warning until the release is cut
+/// and its digests recorded here.
 #[cfg(feature = "use_prebuilt_xgb")]
-const PREBUILT_SHA256: &[(&str, &str, &str)] = &[
-    (
-        "linux_amd64",
-        "libxgboost.so",
-        "7187aed5c7c5f173b2bfec5685dc8fece7bf1c9660452d0438559af87f91c48f",
-    ),
-    (
-        "linux_amd64",
-        "libdmlc.a",
-        "91eb93f9929680235e8dd20a3ae150c2e2b8bdb20d27a49ec98dfa0167517a6c",
-    ),
-    (
-        "linux_arm64",
-        "libxgboost.so",
-        "269d565c1835383d72df84682caa3d6b06d3e93f0629583608698c8faff2e555",
-    ),
-    (
-        "linux_arm64",
-        "libdmlc.a",
-        "f127a5c7895f8048c109cc1e2526d92e5fe24d138bdd5ad54bd535e2177d8c2a",
-    ),
-    (
-        "mac_arm64",
-        "libxgboost.dylib",
-        "0dbe3b5c9221cccf5eb437e70273506bff8182ce428a5569e945c54579801bdc",
-    ),
-    (
-        "mac_arm64",
-        "libdmlc.a",
-        "2058df2e8450741d2e865d008f5eac0269a09d0ab9ea7e817211b17f6e0fe97f",
-    ),
-    (
-        "win_amd64",
-        "xgboost.dll",
-        "8ddb8a1bcd0f9a709d6e3f56b9751f46de093b11cec8a3d4593cc09d3d28308c",
-    ),
-    (
-        "win_amd64",
-        "xgboost.lib",
-        "3eeba07c32d5137c5cdc54236e910b83cd69fe89572e254b3a04f3b393f25814",
-    ),
-];
+const PREBUILT_SHA256: &[(&str, &str, &str)] = &[];
 
 #[cfg(feature = "use_prebuilt_xgb")]
 fn expected_sha256(target_dir: &str, file: &str) -> Option<&'static str> {

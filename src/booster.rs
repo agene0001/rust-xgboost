@@ -2501,6 +2501,10 @@ mod tests {
             .unwrap();
         let booster = Booster::train(&training_params).unwrap();
 
+        // `gain=` is ulp-sensitive across XGBoost versions, since the split gain is
+        // computed from the already-rounded leaf weight. Re-derive these values on
+        // a version bump rather than loosening to a tolerance: exactness is what
+        // makes this test a canary.
         assert_eq!(
             booster.dump_model(true, None).unwrap(),
             "0:[f29<2.00001001] yes=1,no=2,missing=2,gain=4000.53101,cover=1628.25
@@ -2511,7 +2515,7 @@ mod tests {
 		5:leaf=-1.70044053,cover=112.5
 		6:leaf=1.71217716,cover=812
 
-0:[f60<2.00001001] yes=1,no=2,missing=2,gain=832.544983,cover=788.852051
+0:[f60<2.00001001] yes=1,no=2,missing=2,gain=832.545044,cover=788.852051
 	1:leaf=-6.23624468,cover=20.462389
 	2:[f29<2.00001001] yes=3,no=4,missing=4,gain=569.725098,cover=768.389709
 		3:leaf=-0.968530357,cover=309.45282
@@ -2521,24 +2525,24 @@ mod tests {
 	1:[f111<2.00001001] yes=3,no=4,missing=4,gain=258.184326,cover=236.018005
 		3:leaf=-9.421422,cover=2.53038669
 		4:leaf=-0.791407049,cover=233.487625
-	2:[f67<2.00001001] yes=5,no=6,missing=6,gain=226.336975,cover=221.051468
+	2:[f67<2.00001001] yes=5,no=6,missing=6,gain=226.33696,cover=221.051468
 		5:leaf=5.77228642,cover=8.05200672
 		6:leaf=0.658725023,cover=212.999451
 
-0:[f27<2.00001001] yes=1,no=2,missing=2,gain=140.486053,cover=364.119354
+0:[f27<2.00001001] yes=1,no=2,missing=2,gain=140.486069,cover=364.119354
 	1:leaf=1.07747853,cover=90.0174103
-	2:[f39<2.00001001] yes=3,no=4,missing=4,gain=139.860519,cover=274.101959
+	2:[f39<2.00001001] yes=3,no=4,missing=4,gain=139.860504,cover=274.101959
 		3:leaf=-0.877905607,cover=178.241974
 		4:leaf=0.614153326,cover=95.8599854
 
-0:[f109<2.00001001] yes=1,no=2,missing=2,gain=112.605019,cover=189.202194
+0:[f109<2.00001001] yes=1,no=2,missing=2,gain=112.605011,cover=189.202194
 	1:leaf=2.92190909,cover=11.4303684
 	2:[f36<2.00001001] yes=3,no=4,missing=4,gain=66.4029999,cover=177.771835
 		3:leaf=0.152607277,cover=135.494431
 		4:leaf=-1.26934469,cover=42.277401
 
-0:[f23<2.00001001] yes=1,no=2,missing=2,gain=52.5610313,cover=170.612762
-	1:[f36<2.00001001] yes=3,no=4,missing=4,gain=12.4420547,cover=19.731596
+0:[f23<2.00001001] yes=1,no=2,missing=2,gain=52.5610275,cover=170.612762
+	1:[f36<2.00001001] yes=3,no=4,missing=4,gain=12.4420624,cover=19.731596
 		3:leaf=-1.02315068,cover=16.0739021
 		4:leaf=-3.02413678,cover=3.65769386
 	2:[f24<2.00001001] yes=5,no=6,missing=6,gain=67.3869553,cover=150.881165
@@ -2546,22 +2550,22 @@ mod tests {
 		6:leaf=0.431742132,cover=131.902222
 
 0:[f29<2.00001001] yes=1,no=2,missing=2,gain=66.2389145,cover=142.360611
-	1:[f109<2.00001001] yes=3,no=4,missing=4,gain=12.1987419,cover=69.6048737
+	1:[f109<2.00001001] yes=3,no=4,missing=4,gain=12.1987381,cover=69.6048737
 		3:leaf=0.836115122,cover=3.48375821
 		4:leaf=-0.912605286,cover=66.1211166
-	2:[f24<2.00001001] yes=5,no=6,missing=6,gain=31.229435,cover=72.7557373
+	2:[f24<2.00001001] yes=5,no=6,missing=6,gain=31.2294331,cover=72.7557373
 		5:leaf=-1.19710124,cover=8.22473907
 		6:leaf=0.777142286,cover=64.5309982
 
 0:[f39<2.00001001] yes=1,no=2,missing=2,gain=20.6531773,cover=79.4027634
-	1:[f27<2.00001001] yes=3,no=4,missing=4,gain=22.1144371,cover=44.4738464
+	1:[f27<2.00001001] yes=3,no=4,missing=4,gain=22.1144333,cover=44.4738464
 		3:leaf=0.890622675,cover=7.49097395
 		4:leaf=-0.908311546,cover=36.982872
 	2:[f112<2.00001001] yes=5,no=6,missing=6,gain=16.0703697,cover=34.9289207
 		5:leaf=1.4361918,cover=9.89693928
 		6:leaf=-0.0180106498,cover=25.0319824
 
-0:[f23<2.00001001] yes=1,no=2,missing=2,gain=11.7128553,cover=53.3251991
+0:[f23<2.00001001] yes=1,no=2,missing=2,gain=11.7128544,cover=53.3251991
 	1:leaf=-1.01502442,cover=9.02525806
 	2:[f102<2.00001001] yes=3,no=4,missing=4,gain=12.5461531,cover=44.299942
 		3:leaf=0.56883812,cover=28.5100231
@@ -2571,7 +2575,7 @@ mod tests {
 	1:[f61<2.00001001] yes=3,no=4,missing=4,gain=19.3462334,cover=2.87474418
 		3:leaf=-0.609474957,cover=1.53319895
 		4:leaf=3.63442755,cover=1.34154534
-	2:[f29<2.00001001] yes=5,no=6,missing=6,gain=10.1308861,cover=43.0564575
+	2:[f29<2.00001001] yes=5,no=6,missing=6,gain=10.1308851,cover=43.0564575
 		5:leaf=-0.734555721,cover=20.7280827
 		6:leaf=0.217203051,cover=22.3283749
 "

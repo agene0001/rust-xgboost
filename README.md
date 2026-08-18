@@ -146,7 +146,7 @@ The version number tracks the bundled XGBoost version.
 This is still a very early stage of development, so the API is changing as usability issues occur,
 or new features are supported. This is still expected to be compatible to an earlier rust-xgboost library.
 
-Builds against XGBoost 3.3.0.
+Builds against XGBoost 3.4.1.
 
 ## Use prebuilt xgboost library or build it
 
@@ -154,19 +154,20 @@ Xgboost is kind of complicated to compile, especially when there is GPU support 
 It is sometimes easier to use a pre-built library, which the `use_prebuilt_xgb` feature does.
 
 This fork builds from the pinned submodule by default (`local_build`), because the bundled headers
-and the library have to be the same XGBoost version — linking 3.0.x binaries against 3.3.0 headers
+and the library have to be the same XGBoost version — linking 3.0.x binaries against 3.4.1 headers
 fails at run time, far from the cause, with errors like `Unknown objective function: reg:expectile`.
 
-With `use_prebuilt_xgb`, the library is downloaded from this repository's release for the crate
-version. The tag is derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a
-release that was never published fails the build loudly instead of silently falling back to
-version-skewed binaries.
+With `use_prebuilt_xgb`, the library is downloaded from this repository's `v<crate version>` GitHub
+release (built from the pinned submodule by the `Release XGBoost binaries` workflow). The tag is
+derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a release that was never
+published fails the build loudly instead of silently falling back to version-skewed binaries.
 
-Every downloaded asset is verified against a SHA-256 recorded in `xgboost-sys/build.rs`. The check
-runs before the bytes are written, so a truncated transfer, a body mangled in transit, or an asset
-re-uploaded under a tag that was already consumed is rejected rather than left on disk as a library.
-An asset with no recorded digest is accepted with a warning; set `XGB_REQUIRE_CHECKSUMS=1` to make
-that an error instead, which is what CI should do.
+A downloaded asset is verified against a SHA-256 recorded in `xgboost-sys/build.rs` when one is on
+record for that release. The check runs before the bytes are written, so a truncated transfer, a body
+mangled in transit, or an asset re-uploaded under a tag that was already consumed is rejected rather
+than left on disk as a library. Digests are per release and **none are recorded for 3.4.1 yet** — its
+assets have not been published — so every asset currently downloads with an "unverified" warning.
+Set `XGB_REQUIRE_CHECKSUMS=1` to turn that warning into an error instead, which is what CI should do.
 
 To fetch the same assets from a mirror, serve them under the same flat `<platform>-<file>` names and
 set:
