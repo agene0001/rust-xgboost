@@ -131,7 +131,7 @@ fn main() {
     let triplet_mat = sprs::TriMatBase::from_triplets(shape, rows, cols, data);
     let csr_mat = triplet_mat.to_csr();
 
-    let indptr: Vec<u64> = csr_mat.indptr().raw_storage().iter().map(|&i| i as u64).collect();
+    let indptr: Vec<u64> = csr_mat.indptr().raw_storage().iter().map(|&i: &usize| i as u64).collect();
     let indices: Vec<u64> = csr_mat.indices().iter().map(|&i| i as u64).collect();
     let mut dtrain = DMatrix::from_csr(&indptr, &indices, csr_mat.data(), num_col).unwrap();
     dtrain.set_labels(&labels).unwrap();
