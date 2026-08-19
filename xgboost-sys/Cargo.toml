@@ -18,11 +18,12 @@ exclude = [
 bindgen = { version = "0.72.1" }
 dunce =  { version = "1.0.5" }
 reqwest = { version = "0.13.4", features = ["blocking"], optional = true }
+sha2 = { version = "0.10.9", optional = true }
 cmake = { version = "0.1.58", optional = true }
 
 [features]
 # Source build by default; see the workspace Cargo.toml for rationale.
 default = ["local_build"]
-use_prebuilt_xgb = ["reqwest"]
+use_prebuilt_xgb = ["reqwest", "sha2"]
 local_build = ["cmake"]
 cuda = []

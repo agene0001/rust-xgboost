@@ -29,6 +29,109 @@ fn prebuilt_release_url() -> String {
     )
 }
 
+/// Base URL the release assets are fetched from: `$XGBOOST_LIB_URL` when set,
+/// otherwise this crate version's release.
+///
+/// A mirror is expected to serve the same flat `<target>-<file>` layout the
+/// GitHub release uses, so it can stand in without any other change.
+#[cfg(feature = "use_prebuilt_xgb")]
+fn release_base_url() -> String {
+    match env::var("XGBOOST_LIB_URL") {
+        Ok(url) if !url.trim().is_empty() => url.trim_end_matches('/').to_string(),
+        _ => prebuilt_release_url(),
+    }
+}
+
+/// SHA-256 of each published release asset, as `(target_dir, file, digest)`.
+///
+/// Verification is what makes the release contract enforceable rather than
+/// merely documented. `error_for_status` already stops a 404 page being written
+/// out as a library, but it cannot catch a truncated transfer, a body mangled
+/// by an intercepting proxy, or a release asset re-uploaded with different
+/// contents under a tag that was already consumed.
+///
+/// Digests are specific to a crate version, because `prebuilt_release_url`
+/// derives the tag from `CARGO_PKG_VERSION`: a version bump republishes the
+/// assets and needs new entries here. Recompute them against the release with
+///
+/// ```sh
+/// gh release download v$VERSION --repo agene0001/rust-xgboost --dir /tmp/assets
+/// sha256sum /tmp/assets/*
+/// ```
+///
+/// An asset with no entry is downloaded and accepted with a warning rather than
+/// failing the build, so adding a platform does not require a digest up front;
+/// `XGB_REQUIRE_CHECKSUMS=1` turns that warning into an error, which is what CI
+/// should set.
+///
+/// Recorded from the v3.3.0 release assets.
+#[cfg(feature = "use_prebuilt_xgb")]
+const PREBUILT_SHA256: &[(&str, &str, &str)] = &[
+    (
+        "linux_amd64",
+        "libxgboost.so",
+        "7187aed5c7c5f173b2bfec5685dc8fece7bf1c9660452d0438559af87f91c48f",
+    ),
+    (
+        "linux_amd64",
+        "libdmlc.a",
+        "91eb93f9929680235e8dd20a3ae150c2e2b8bdb20d27a49ec98dfa0167517a6c",
+    ),
+    (
+        "linux_arm64",
+        "libxgboost.so",
+        "269d565c1835383d72df84682caa3d6b06d3e93f0629583608698c8faff2e555",
+    ),
+    (
+        "linux_arm64",
+        "libdmlc.a",
+        "f127a5c7895f8048c109cc1e2526d92e5fe24d138bdd5ad54bd535e2177d8c2a",
+    ),
+    (
+        "mac_arm64",
+        "libxgboost.dylib",
+        "0dbe3b5c9221cccf5eb437e70273506bff8182ce428a5569e945c54579801bdc",
+    ),
+    (
+        "mac_arm64",
+        "libdmlc.a",
+        "2058df2e8450741d2e865d008f5eac0269a09d0ab9ea7e817211b17f6e0fe97f",
+    ),
+    (
+        "win_amd64",
+        "xgboost.dll",
+        "8ddb8a1bcd0f9a709d6e3f56b9751f46de093b11cec8a3d4593cc09d3d28308c",
+    ),
+    (
+        "win_amd64",
+        "xgboost.lib",
+        "3eeba07c32d5137c5cdc54236e910b83cd69fe89572e254b3a04f3b393f25814",
+    ),
+];
+
+#[cfg(feature = "use_prebuilt_xgb")]
+fn expected_sha256(target_dir: &str, file: &str) -> Option<&'static str> {
+    PREBUILT_SHA256
+        .iter()
+        .find(|(t, f, _)| *t == target_dir && *f == file)
+        .map(|(_, _, digest)| *digest)
+}
+
+#[cfg(feature = "use_prebuilt_xgb")]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
+}
+
 /// Version of the bundled XGBoost submodule, parsed from its `version_config.h`.
 fn bundled_xgboost_version(xgb_root: &Path) -> String {
     let header = xgb_root.join("include").join("xgboost").join("version_config.h");
@@ -102,6 +205,10 @@ fn main() {
 
     #[cfg(feature = "use_prebuilt_xgb")]
     {
+        for var in ["XGBOOST_LIB_DIR", "XGBOOST_LIB_URL"] {
+            println!("cargo:rerun-if-env-changed={var}");
+        }
+
         if let Ok(xgboost_lib_dir) = std::env::var("XGBOOST_LIB_DIR") {
             println!("cargo:rustc-link-search=native={}", xgboost_lib_dir);
         } else {
@@ -340,22 +447,45 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// cause (a missing v3.3.0 release surfaced as an "Unknown objective function:
 /// reg:expectileerror" test failure, not as a build error). Set
 /// `XGB_ALLOW_LEGACY_PREBUILT=1` to opt back into that fallback.
+///
+/// The asset is verified against [`PREBUILT_SHA256`] when its digest is on
+/// record; see that table for what happens while one is missing.
 #[cfg(feature = "use_prebuilt_xgb")]
 fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
     let dest = format!("{deps_path}/{file}");
-    let release_url = prebuilt_release_url();
-    let primary = format!("{release_url}/{target_dir}-{file}");
-    if web_copy(&primary, &dest).is_ok() {
-        return Ok(());
+    let expected = expected_sha256(target_dir, file);
+    if expected.is_none() {
+        println!("cargo:rerun-if-env-changed=XGB_REQUIRE_CHECKSUMS");
+        if env::var("XGB_REQUIRE_CHECKSUMS").is_ok_and(|v| v == "1") {
+            panic!(
+                "no recorded SHA-256 for {target_dir}/{file}, and XGB_REQUIRE_CHECKSUMS=1.\n\
+                 Add the digest to PREBUILT_SHA256 in xgboost-sys/build.rs, or build from source \
+                 with `cargo build --features local_build` (this crate's default)."
+            );
+        }
+        println!(
+            "cargo:warning=no recorded SHA-256 for {target_dir}/{file}; accepting the download \
+             unverified. Record the digest in PREBUILT_SHA256 (xgboost-sys/build.rs), or set \
+             XGB_REQUIRE_CHECKSUMS=1 to make this an error."
+        );
     }
+
+    let release_url = release_base_url();
+    let primary = format!("{release_url}/{target_dir}-{file}");
+    let primary_err = match web_copy(&primary, &dest, expected) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
 
     println!("cargo:rerun-if-env-changed=XGB_ALLOW_LEGACY_PREBUILT");
     if !env::var("XGB_ALLOW_LEGACY_PREBUILT").is_ok_and(|v| v == "1") {
         panic!(
-            "prebuilt asset is unavailable: {primary}\n\
+            "prebuilt asset is unusable: {primary}\n\
+             \x20 cause: {primary_err}\n\
              \n\
-             The release for this crate version has not been published (the tag is derived from \
-             CARGO_PKG_VERSION = {version}). Fix by either:\n\
+             Usually the release for this crate version has not been published (the tag is derived \
+             from CARGO_PKG_VERSION = {version}); a checksum mismatch above instead means the asset \
+             was served but did not match PREBUILT_SHA256. Fix by either:\n\
              \n\
              1. Publishing the assets: run the `Release XGBoost binaries` workflow\n\
              \x20  (`gh workflow run release-libs.yml`) — it defaults to the tag this build\n\
@@ -372,20 +502,40 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
     }
 
     println!(
-        "cargo:warning=prebuilt asset {primary} unavailable; XGB_ALLOW_LEGACY_PREBUILT=1 is set, so \
-         falling back to legacy XGBoost 3.0.0 binaries. These are older than the bundled headers — \
-         APIs added since 3.0 will fail at run time."
+        "cargo:warning=prebuilt asset {primary} unusable ({primary_err}); \
+         XGB_ALLOW_LEGACY_PREBUILT=1 is set, so falling back to legacy XGBoost 3.0.0 binaries. \
+         These are older than the bundled headers — APIs added since 3.0 will fail at run time."
     );
-    web_copy(&format!("{LEGACY_URL}/{target_dir}/{file}"), &dest)
+    // Unpinned: the legacy binaries predate PREBUILT_SHA256 and are a different
+    // XGBoost version, so there is no digest of this crate's assets to hold
+    // them to. The opt-in env var and the warning above are the safeguard.
+    web_copy(&format!("{LEGACY_URL}/{target_dir}/{file}"), &dest, None)
 }
 
+/// Download `web_src` to `target`, rejecting it unless it hashes to `expected`.
+///
+/// `expected` is `None` only for a source whose contents are not pinned (the
+/// legacy fallback), or while an asset's digest has not been recorded yet.
 #[cfg(feature = "use_prebuilt_xgb")]
-fn web_copy(web_src: &str, target: &str) -> Result<()> {
+fn web_copy(web_src: &str, target: &str, expected: Option<&str>) -> Result<()> {
     dbg!(&web_src);
     // error_for_status is load-bearing: without it a 404 page would be written
     // out as the library file, and the fallback in fetch_lib would never run.
     let resp = reqwest::blocking::get(web_src)?.error_for_status()?;
     let body = resp.bytes()?;
+
+    if let Some(want) = expected {
+        let got = sha256_hex(&body);
+        if !got.eq_ignore_ascii_case(want) {
+            // An error rather than a panic, so a mismatch reads as "this source
+            // did not work out" and fetch_lib falls through to its next option
+            // exactly as it does for a 404.
+            return Err(format!("checksum mismatch for {web_src}: expected {want}, got {got}").into());
+        }
+    }
+
+    // Written only once the bytes are known good, so a rejected download never
+    // lands on disk where a later build would find it and skip the fetch.
     std::fs::write(target, &body)?;
     Ok(())
 }

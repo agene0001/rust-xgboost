@@ -146,13 +146,37 @@ The version number tracks the bundled XGBoost version.
 This is still a very early stage of development, so the API is changing as usability issues occur,
 or new features are supported. This is still expected to be compatible to an earlier rust-xgboost library.
 
-Builds against XGBoost 3.2.0.
+Builds against XGBoost 3.3.0.
 
 ## Use prebuilt xgboost library or build it
 
 Xgboost is kind of complicated to compile, especially when there is GPU support involved.
-It is sometimes easier to use a pre-build library. Therefore, the feature flag `use_prebuilt_xgb` is enabled by default.
-This is using a prebuilt shared library in xboost-sys/lib by default. You can also use a custom folder by defining `$XGBOOST_LIB_DIR`.
+It is sometimes easier to use a pre-built library, which the `use_prebuilt_xgb` feature does.
+
+This fork builds from the pinned submodule by default (`local_build`), because the bundled headers
+and the library have to be the same XGBoost version — linking 3.0.x binaries against 3.3.0 headers
+fails at run time, far from the cause, with errors like `Unknown objective function: reg:expectile`.
+
+With `use_prebuilt_xgb`, the library is downloaded from this repository's release for the crate
+version. The tag is derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a
+release that was never published fails the build loudly instead of silently falling back to
+version-skewed binaries.
+
+Every downloaded asset is verified against a SHA-256 recorded in `xgboost-sys/build.rs`. The check
+runs before the bytes are written, so a truncated transfer, a body mangled in transit, or an asset
+re-uploaded under a tag that was already consumed is rejected rather than left on disk as a library.
+An asset with no recorded digest is accepted with a warning; set `XGB_REQUIRE_CHECKSUMS=1` to make
+that an error instead, which is what CI should do.
+
+To fetch the same assets from a mirror, serve them under the same flat `<platform>-<file>` names and
+set:
+
+```sh
+XGBOOST_LIB_URL=https://your-mirror.example/xgboost-libs
+```
+
+You can also point at an existing directory of libraries with `$XGBOOST_LIB_DIR`, in which case
+nothing is downloaded or verified.
 
 If you prefer to use xgboost from homebrew, which may have GPU support, your can for example define
 ```
