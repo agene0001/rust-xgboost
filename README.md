@@ -25,7 +25,9 @@ On debian, you need `libclang-dev` (`apt install -y libclang-dev`)
 
 ## Documentation
 
-* [Documentation](https://docs.rs/xgboost)
+This crate is not published to crates.io, so there is no docs.rs page. Depend on
+it by git or path, and build the API documentation locally with
+`cargo doc --open`.
 
 Basic usage example:
 
@@ -129,7 +131,9 @@ XGB_BUILD_IPO=1     # link-time optimization for libxgboost; off by default
 Native codegen is on by default because a from-source build usually runs on the
 machine that built it; disable it when deploying the locally built binary to
 other machines (or older CPUs of the same family). Expect the largest gains
-from native codegen on x86-64 hosts with AVX2/AVX-512.
+from native codegen on x86-64 hosts with AVX2/AVX-512. It is not applied under
+MSVC, which has no "tune for this CPU" flag -- `cl.exe` ignores `-march=native`
+-- so Windows source builds are portable either way.
 
 For large training sets with the `hist` tree method, prefer
 `DMatrix::from_dense_quantile` / `from_csr_quantile`, which store pre-binned data
@@ -244,16 +248,21 @@ When deploying, copy the staged library alongside the executable.
 
 ### Supported Platforms
 
-Prebuilt lib and built locally:
+Built from source (`local_build`, the default) and available as a prebuilt
+download (`use_prebuilt_xgb`):
 
-* Mac OS
-* Linux
+* macOS (Apple silicon)
+* Linux (x86-64 and aarch64)
+* Windows (x86-64, MSVC)
 
-Prebuilt lib only
+Each is built from the pinned submodule and tested in CI on every push.
 
-* Windows 
+The Windows source build needs no manual copying of Visual Studio output --
+cmake's install step places the DLL and import library where the build script
+looks for them.
 
-Local windows built is possible, but steps may require manual copy of VS output files.
+Intel macOS builds from source too, but has no prebuilt asset; for that path
+point `XGBOOST_LIB_DIR` (or `HOMEBREW_PREFIX`) at a library of your own.
 
 GPU support on windows:
 
