@@ -25,7 +25,9 @@ On debian, you need `libclang-dev` (`apt install -y libclang-dev`)
 
 ## Documentation
 
-* [Documentation](https://docs.rs/xgboost)
+This crate is not published to crates.io, so there is no docs.rs page. Depend on
+it by git or path, and build the API documentation locally with
+`cargo doc --open`.
 
 Basic usage example:
 
@@ -129,7 +131,9 @@ XGB_BUILD_IPO=1     # link-time optimization for libxgboost; off by default
 Native codegen is on by default because a from-source build usually runs on the
 machine that built it; disable it when deploying the locally built binary to
 other machines (or older CPUs of the same family). Expect the largest gains
-from native codegen on x86-64 hosts with AVX2/AVX-512.
+from native codegen on x86-64 hosts with AVX2/AVX-512. It is not applied under
+MSVC, which has no "tune for this CPU" flag -- `cl.exe` ignores `-march=native`
+-- so Windows source builds are portable either way.
 
 For large training sets with the `hist` tree method, prefer
 `DMatrix::from_dense_quantile` / `from_csr_quantile`, which store pre-binned data
@@ -146,7 +150,7 @@ The version number tracks the bundled XGBoost version.
 This is still a very early stage of development, so the API is changing as usability issues occur,
 or new features are supported. This is still expected to be compatible to an earlier rust-xgboost library.
 
-Builds against XGBoost 3.3.0.
+Builds against XGBoost 3.4.1.
 
 ## Use prebuilt xgboost library or build it
 
@@ -154,19 +158,19 @@ Xgboost is kind of complicated to compile, especially when there is GPU support 
 It is sometimes easier to use a pre-built library, which the `use_prebuilt_xgb` feature does.
 
 This fork builds from the pinned submodule by default (`local_build`), because the bundled headers
-and the library have to be the same XGBoost version — linking 3.0.x binaries against 3.3.0 headers
+and the library have to be the same XGBoost version — linking 3.0.x binaries against 3.4.1 headers
 fails at run time, far from the cause, with errors like `Unknown objective function: reg:expectile`.
 
-With `use_prebuilt_xgb`, the library is downloaded from this repository's release for the crate
-version. The tag is derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a
-release that was never published fails the build loudly instead of silently falling back to
-version-skewed binaries.
+With `use_prebuilt_xgb`, the library is downloaded from this repository's `v<crate version>` GitHub
+release (built from the pinned submodule by the `Release XGBoost binaries` workflow). The tag is
+derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a release that was never
+published fails the build loudly instead of silently falling back to version-skewed binaries.
 
-Every downloaded asset is verified against a SHA-256 recorded in `xgboost-sys/build.rs`. The check
-runs before the bytes are written, so a truncated transfer, a body mangled in transit, or an asset
-re-uploaded under a tag that was already consumed is rejected rather than left on disk as a library.
-An asset with no recorded digest is accepted with a warning; set `XGB_REQUIRE_CHECKSUMS=1` to make
-that an error instead, which is what CI should do.
+Every downloaded asset is verified against a SHA-256 recorded in
+`xgboost-sys/prebuilt-checksums.json`. The check runs before the bytes are written, so a truncated
+transfer, a body mangled in transit, or an asset re-uploaded under a tag that was already consumed is
+rejected rather than left on disk as a library. An asset with no recorded digest is accepted with a
+warning; set `XGB_REQUIRE_CHECKSUMS=1` to make that an error instead, which is what CI should do.
 
 To fetch the same assets from a mirror, serve them under the same flat `<platform>-<file>` names and
 set:
@@ -243,16 +247,21 @@ When deploying, copy the staged library alongside the executable.
 
 ### Supported Platforms
 
-Prebuilt lib and built locally:
+Built from source (`local_build`, the default) and available as a prebuilt
+download (`use_prebuilt_xgb`):
 
-* Mac OS
-* Linux
+* macOS (Apple silicon)
+* Linux (x86-64 and aarch64)
+* Windows (x86-64, MSVC)
 
-Prebuilt lib only
+Each is built from the pinned submodule and tested in CI on every push.
 
-* Windows 
+The Windows source build needs no manual copying of Visual Studio output --
+cmake's install step places the DLL and import library where the build script
+looks for them.
 
-Local windows built is possible, but steps may require manual copy of VS output files.
+Intel macOS builds from source too, but has no prebuilt asset; for that path
+point `XGBOOST_LIB_DIR` (or `HOMEBREW_PREFIX`) at a library of your own.
 
 GPU support on windows:
 

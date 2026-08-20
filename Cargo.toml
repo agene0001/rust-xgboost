@@ -1,6 +1,18 @@
+# Membership plus `default-members` is what runs xgboost-sys's own tests: cargo
+# does not build a path dependency's test targets, and in a workspace whose root
+# is itself a package a bare `cargo test` runs only the root package.
+#
+# examples/ holds standalone crates on older editions with pinned dependencies,
+# run in place by examples/runall.sh. Excluding them keeps `cargo run` working
+# inside each one and their dependency trees out of this workspace.
+[workspace]
+members = ["xgboost-sys"]
+default-members = [".", "xgboost-sys"]
+exclude = ["examples"]
+
 [package]
 name = "xgb"
-version = "3.3.0"
+version = "3.4.1"
 authors = ["Dave Challis <dave@suicas.net>", "Marco Mengelkoch", "Felix Agene <agene001@umn.edu>"]
 license = "MIT"
 repository = "https://github.com/agene0001/rust-xgboost"
@@ -16,7 +28,7 @@ edition = "2024"
 # --no-default-features --features use_prebuilt_xgb, running both the binary
 # download AND the cmake source build. Feature selection must flow only
 # through this crate's feature list below.
-xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.3.0", default-features = false }
+xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.4.1", default-features = false }
 libc = "0.2.189"
 derive_builder = "0.20.2"
 log = "0.4.33"

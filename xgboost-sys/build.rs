@@ -42,7 +42,8 @@ fn release_base_url() -> String {
     }
 }
 
-/// SHA-256 of each published release asset, as `(target_dir, file, digest)`.
+/// SHA-256 of each published release asset, under `assets` as a JSON object
+/// mapping the release-asset name (`<target_dir>-<file>`) to its digest.
 ///
 /// Verification is what makes the release contract enforceable rather than
 /// merely documented. `error_for_status` already stops a 404 page being written
@@ -63,58 +64,26 @@ fn release_base_url() -> String {
 /// failing the build, so adding a platform does not require a digest up front;
 /// `XGB_REQUIRE_CHECKSUMS=1` turns that warning into an error, which is what CI
 /// should set.
-///
-/// Recorded from the v3.3.0 release assets.
 #[cfg(feature = "use_prebuilt_xgb")]
-const PREBUILT_SHA256: &[(&str, &str, &str)] = &[
-    (
-        "linux_amd64",
-        "libxgboost.so",
-        "7187aed5c7c5f173b2bfec5685dc8fece7bf1c9660452d0438559af87f91c48f",
-    ),
-    (
-        "linux_amd64",
-        "libdmlc.a",
-        "91eb93f9929680235e8dd20a3ae150c2e2b8bdb20d27a49ec98dfa0167517a6c",
-    ),
-    (
-        "linux_arm64",
-        "libxgboost.so",
-        "269d565c1835383d72df84682caa3d6b06d3e93f0629583608698c8faff2e555",
-    ),
-    (
-        "linux_arm64",
-        "libdmlc.a",
-        "f127a5c7895f8048c109cc1e2526d92e5fe24d138bdd5ad54bd535e2177d8c2a",
-    ),
-    (
-        "mac_arm64",
-        "libxgboost.dylib",
-        "0dbe3b5c9221cccf5eb437e70273506bff8182ce428a5569e945c54579801bdc",
-    ),
-    (
-        "mac_arm64",
-        "libdmlc.a",
-        "2058df2e8450741d2e865d008f5eac0269a09d0ab9ea7e817211b17f6e0fe97f",
-    ),
-    (
-        "win_amd64",
-        "xgboost.dll",
-        "8ddb8a1bcd0f9a709d6e3f56b9751f46de093b11cec8a3d4593cc09d3d28308c",
-    ),
-    (
-        "win_amd64",
-        "xgboost.lib",
-        "3eeba07c32d5137c5cdc54236e910b83cd69fe89572e254b3a04f3b393f25814",
-    ),
-];
+const PREBUILT_CHECKSUMS_JSON: &str = include_str!("prebuilt-checksums.json");
+
+#[cfg(feature = "use_prebuilt_xgb")]
+fn checksums() -> &'static std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CHECKSUMS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    CHECKSUMS.get_or_init(|| {
+        let doc: serde_json::Value = serde_json::from_str(PREBUILT_CHECKSUMS_JSON)
+            .expect("xgboost-sys/prebuilt-checksums.json is not valid JSON");
+        serde_json::from_value(doc["assets"].clone())
+            .expect("xgboost-sys/prebuilt-checksums.json: \"assets\" must map asset name to SHA-256")
+    })
+}
 
 #[cfg(feature = "use_prebuilt_xgb")]
 fn expected_sha256(target_dir: &str, file: &str) -> Option<&'static str> {
-    PREBUILT_SHA256
-        .iter()
-        .find(|(t, f, _)| *t == target_dir && *f == file)
-        .map(|(_, _, digest)| *digest)
+    checksums().get(&format!("{target_dir}-{file}")).map(String::as_str)
 }
 
 #[cfg(feature = "use_prebuilt_xgb")]
@@ -135,8 +104,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Version of the bundled XGBoost submodule, parsed from its `version_config.h`.
 fn bundled_xgboost_version(xgb_root: &Path) -> String {
     let header = xgb_root.join("include").join("xgboost").join("version_config.h");
-    let text =
-        std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("cannot read {}: {e}", header.display()));
+    let text = std::fs::read_to_string(&header).unwrap_or_else(|e| panic!("cannot read {}: {e}", header.display()));
     let field = |name: &str| -> u32 {
         let needle = format!("#define {name} ");
         text.lines()
@@ -184,6 +152,11 @@ fn main() {
     let wrapper_h = xgb_root.join("include").join("xgboost").join("c_api.h");
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
+        // c_api.h's doxygen prose is not valid Rust, and rustdoc extracts the C
+        // snippets in it as doctests. `cargo test --doc` runs those even with
+        // `[lib] doctest = false`, so keep them out of the bindings entirely.
+        .generate_comments(false)
+        .opaque_type("_IO_FILE")
         .clang_arg(format!("-I{}", xgb_root.join("include").display()))
         .clang_arg(format!("-I{}", xgb_root.join("dmlc-core").join("include").display()));
 
@@ -222,11 +195,7 @@ fn main() {
                 }
                 stage_lib_next_to_exe(Path::new(&format!("{deps_path}/libxgboost.dylib")), &out_dir);
             } else if cfg!(target_os = "linux") {
-                let target_dir = if cfg!(target_arch = "aarch64") {
-                    "linux_arm64"
-                } else {
-                    "linux_amd64"
-                };
+                let target_dir = if cfg!(target_arch = "aarch64") { "linux_arm64" } else { "linux_amd64" };
                 if !std::fs::exists(format!("{deps_path}/libxgboost.so")).unwrap() {
                     fetch_lib(target_dir, "libxgboost.so", &deps_path).unwrap();
                     fetch_lib(target_dir, "libdmlc.a", &deps_path).unwrap();
@@ -283,13 +252,13 @@ fn main() {
         // built artifact are the exception and opt out with XGB_BUILD_NATIVE=0.
         // The distributed release assets are unaffected — release-libs.yml
         // invokes cmake directly and never runs this script.
+        //
+        // Not for MSVC: cl.exe answers `-march=native` with `D9002` on every
+        // translation unit, so it never applied there. windows-gnu is GCC and
+        // keeps it.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_NATIVE");
-        if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") {
-            let flag = if target.contains("aarch64") {
-                "-mcpu=native"
-            } else {
-                "-march=native"
-            };
+        if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") && !target.contains("msvc") {
+            let flag = if target.contains("aarch64") { "-mcpu=native" } else { "-march=native" };
             dst.cflag(flag).cxxflag(flag);
         }
         // XGB_BUILD_IPO=1 enables link-time optimization (CMake IPO) for the
@@ -297,11 +266,7 @@ fn main() {
         // -D values persist in CMakeCache.txt across reconfigures, so an
         // explicit OFF is required for unsetting the env var to take effect.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_IPO");
-        let ipo = if env::var("XGB_BUILD_IPO").is_ok_and(|v| v == "1") {
-            "ON"
-        } else {
-            "OFF"
-        };
+        let ipo = if env::var("XGB_BUILD_IPO").is_ok_and(|v| v == "1") { "ON" } else { "OFF" };
         let dst = dst.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", ipo);
 
         // Hide non-API symbols in the shared library. The C API keeps its
@@ -355,6 +320,12 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dst.display());
         println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
         println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
+        // Not needed to link (bin/ holds the Windows runtime library, no import
+        // library), but cargo derives the PATH it gives test processes from these
+        // search dirs, and a doctest binary runs from a temp directory where the
+        // staged copy is not visible. Without it Windows doctests die with
+        // STATUS_DLL_NOT_FOUND.
+        println!("cargo:rustc-link-search=native={}", dst.join("bin").display());
         println!("cargo:rustc-link-lib=static=dmlc");
 
         let lib_file = if target.contains("windows") {
@@ -448,7 +419,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// reg:expectileerror" test failure, not as a build error). Set
 /// `XGB_ALLOW_LEGACY_PREBUILT=1` to opt back into that fallback.
 ///
-/// The asset is verified against [`PREBUILT_SHA256`] when its digest is on
+/// The asset is verified against `prebuilt-checksums.json` when its digest is on
 /// record; see that table for what happens while one is missing.
 #[cfg(feature = "use_prebuilt_xgb")]
 fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
@@ -458,15 +429,16 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
         println!("cargo:rerun-if-env-changed=XGB_REQUIRE_CHECKSUMS");
         if env::var("XGB_REQUIRE_CHECKSUMS").is_ok_and(|v| v == "1") {
             panic!(
-                "no recorded SHA-256 for {target_dir}/{file}, and XGB_REQUIRE_CHECKSUMS=1.\n\
-                 Add the digest to PREBUILT_SHA256 in xgboost-sys/build.rs, or build from source \
-                 with `cargo build --features local_build` (this crate's default)."
+                "no recorded SHA-256 for release asset {target_dir}-{file}, and \
+                 XGB_REQUIRE_CHECKSUMS=1.\n\
+                 Add the digest to xgboost-sys/prebuilt-checksums.json, or build from source with \
+                 `cargo build --features local_build` (this crate's default)."
             );
         }
         println!(
-            "cargo:warning=no recorded SHA-256 for {target_dir}/{file}; accepting the download \
-             unverified. Record the digest in PREBUILT_SHA256 (xgboost-sys/build.rs), or set \
-             XGB_REQUIRE_CHECKSUMS=1 to make this an error."
+            "cargo:warning=no recorded SHA-256 for release asset {target_dir}-{file}; accepting \
+             the download unverified. Record the digest in xgboost-sys/prebuilt-checksums.json, or \
+             set XGB_REQUIRE_CHECKSUMS=1 to make this an error."
         );
     }
 
@@ -485,7 +457,8 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
              \n\
              Usually the release for this crate version has not been published (the tag is derived \
              from CARGO_PKG_VERSION = {version}); a checksum mismatch above instead means the asset \
-             was served but did not match PREBUILT_SHA256. Fix by either:\n\
+             was served but did not match xgboost-sys/prebuilt-checksums.json. Fix by \
+             either:\n\
              \n\
              1. Publishing the assets: run the `Release XGBoost binaries` workflow\n\
              \x20  (`gh workflow run release-libs.yml`) — it defaults to the tag this build\n\
@@ -506,7 +479,7 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
          XGB_ALLOW_LEGACY_PREBUILT=1 is set, so falling back to legacy XGBoost 3.0.0 binaries. \
          These are older than the bundled headers — APIs added since 3.0 will fail at run time."
     );
-    // Unpinned: the legacy binaries predate PREBUILT_SHA256 and are a different
+    // Unpinned: the legacy binaries predate the checksum file and are a different
     // XGBoost version, so there is no digest of this crate's assets to hold
     // them to. The opt-in env var and the warning above are the safeguard.
     web_copy(&format!("{LEGACY_URL}/{target_dir}/{file}"), &dest, None)
