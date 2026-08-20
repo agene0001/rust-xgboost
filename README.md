@@ -166,12 +166,11 @@ release (built from the pinned submodule by the `Release XGBoost binaries` workf
 derived from `CARGO_PKG_VERSION`, so it cannot drift from the crate version: a release that was never
 published fails the build loudly instead of silently falling back to version-skewed binaries.
 
-A downloaded asset is verified against a SHA-256 recorded in `xgboost-sys/build.rs` when one is on
-record for that release. The check runs before the bytes are written, so a truncated transfer, a body
-mangled in transit, or an asset re-uploaded under a tag that was already consumed is rejected rather
-than left on disk as a library. Digests are per release and **none are recorded for 3.4.1 yet** — its
-assets have not been published — so every asset currently downloads with an "unverified" warning.
-Set `XGB_REQUIRE_CHECKSUMS=1` to turn that warning into an error instead, which is what CI should do.
+Every downloaded asset is verified against a SHA-256 recorded in
+`xgboost-sys/prebuilt-checksums.json`. The check runs before the bytes are written, so a truncated
+transfer, a body mangled in transit, or an asset re-uploaded under a tag that was already consumed is
+rejected rather than left on disk as a library. An asset with no recorded digest is accepted with a
+warning; set `XGB_REQUIRE_CHECKSUMS=1` to make that an error instead, which is what CI should do.
 
 To fetch the same assets from a mirror, serve them under the same flat `<platform>-<file>` names and
 set:

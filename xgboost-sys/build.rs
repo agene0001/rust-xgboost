@@ -42,7 +42,8 @@ fn release_base_url() -> String {
     }
 }
 
-/// SHA-256 of each published release asset, as `(target_dir, file, digest)`.
+/// SHA-256 of each published release asset, under `assets` as a JSON object
+/// mapping the release-asset name (`<target_dir>-<file>`) to its digest.
 ///
 /// Verification is what makes the release contract enforceable rather than
 /// merely documented. `error_for_status` already stops a 404 page being written
@@ -63,22 +64,26 @@ fn release_base_url() -> String {
 /// failing the build, so adding a platform does not require a digest up front;
 /// `XGB_REQUIRE_CHECKSUMS=1` turns that warning into an error, which is what CI
 /// should set.
-///
-/// Empty as of the 3.4.1 bump: the recorded digests were the v3.3.0 assets, and
-/// nothing has been published under v3.4.1 yet. Leaving 3.3.0's digests in place
-/// would have reported the first genuine v3.4.1 asset as a checksum mismatch,
-/// because the lookup keys on `(target_dir, file)` and carries no version. Every
-/// asset therefore downloads unverified with a warning until the release is cut
-/// and its digests recorded here.
 #[cfg(feature = "use_prebuilt_xgb")]
-const PREBUILT_SHA256: &[(&str, &str, &str)] = &[];
+const PREBUILT_CHECKSUMS_JSON: &str = include_str!("prebuilt-checksums.json");
+
+#[cfg(feature = "use_prebuilt_xgb")]
+fn checksums() -> &'static std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CHECKSUMS: OnceLock<HashMap<String, String>> = OnceLock::new();
+    CHECKSUMS.get_or_init(|| {
+        let doc: serde_json::Value = serde_json::from_str(PREBUILT_CHECKSUMS_JSON)
+            .expect("xgboost-sys/prebuilt-checksums.json is not valid JSON");
+        serde_json::from_value(doc["assets"].clone())
+            .expect("xgboost-sys/prebuilt-checksums.json: \"assets\" must map asset name to SHA-256")
+    })
+}
 
 #[cfg(feature = "use_prebuilt_xgb")]
 fn expected_sha256(target_dir: &str, file: &str) -> Option<&'static str> {
-    PREBUILT_SHA256
-        .iter()
-        .find(|(t, f, _)| *t == target_dir && *f == file)
-        .map(|(_, _, digest)| *digest)
+    checksums().get(&format!("{target_dir}-{file}")).map(String::as_str)
 }
 
 #[cfg(feature = "use_prebuilt_xgb")]
@@ -414,7 +419,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// reg:expectileerror" test failure, not as a build error). Set
 /// `XGB_ALLOW_LEGACY_PREBUILT=1` to opt back into that fallback.
 ///
-/// The asset is verified against [`PREBUILT_SHA256`] when its digest is on
+/// The asset is verified against `prebuilt-checksums.json` when its digest is on
 /// record; see that table for what happens while one is missing.
 #[cfg(feature = "use_prebuilt_xgb")]
 fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
@@ -424,15 +429,16 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
         println!("cargo:rerun-if-env-changed=XGB_REQUIRE_CHECKSUMS");
         if env::var("XGB_REQUIRE_CHECKSUMS").is_ok_and(|v| v == "1") {
             panic!(
-                "no recorded SHA-256 for {target_dir}/{file}, and XGB_REQUIRE_CHECKSUMS=1.\n\
-                 Add the digest to PREBUILT_SHA256 in xgboost-sys/build.rs, or build from source \
-                 with `cargo build --features local_build` (this crate's default)."
+                "no recorded SHA-256 for release asset {target_dir}-{file}, and \
+                 XGB_REQUIRE_CHECKSUMS=1.\n\
+                 Add the digest to xgboost-sys/prebuilt-checksums.json, or build from source with \
+                 `cargo build --features local_build` (this crate's default)."
             );
         }
         println!(
-            "cargo:warning=no recorded SHA-256 for {target_dir}/{file}; accepting the download \
-             unverified. Record the digest in PREBUILT_SHA256 (xgboost-sys/build.rs), or set \
-             XGB_REQUIRE_CHECKSUMS=1 to make this an error."
+            "cargo:warning=no recorded SHA-256 for release asset {target_dir}-{file}; accepting \
+             the download unverified. Record the digest in xgboost-sys/prebuilt-checksums.json, or \
+             set XGB_REQUIRE_CHECKSUMS=1 to make this an error."
         );
     }
 
@@ -451,7 +457,8 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
              \n\
              Usually the release for this crate version has not been published (the tag is derived \
              from CARGO_PKG_VERSION = {version}); a checksum mismatch above instead means the asset \
-             was served but did not match PREBUILT_SHA256. Fix by either:\n\
+             was served but did not match xgboost-sys/prebuilt-checksums.json. Fix by \
+             either:\n\
              \n\
              1. Publishing the assets: run the `Release XGBoost binaries` workflow\n\
              \x20  (`gh workflow run release-libs.yml`) — it defaults to the tag this build\n\
@@ -472,7 +479,7 @@ fn fetch_lib(target_dir: &str, file: &str, deps_path: &str) -> Result<()> {
          XGB_ALLOW_LEGACY_PREBUILT=1 is set, so falling back to legacy XGBoost 3.0.0 binaries. \
          These are older than the bundled headers — APIs added since 3.0 will fail at run time."
     );
-    // Unpinned: the legacy binaries predate PREBUILT_SHA256 and are a different
+    // Unpinned: the legacy binaries predate the checksum file and are a different
     // XGBoost version, so there is no digest of this crate's assets to hold
     // them to. The opt-in env var and the warning above are the safeguard.
     web_copy(&format!("{LEGACY_URL}/{target_dir}/{file}"), &dest, None)
