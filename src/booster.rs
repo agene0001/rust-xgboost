@@ -1502,8 +1502,11 @@ mod tests {
         assert_eq!(*train_metrics.get("map@4-").unwrap(), 1.0);
 
         let test_metrics = booster.evaluate(&dmat_test).unwrap();
-        let diff = *test_metrics.get("logloss").unwrap() - 0.0069199526;
-        assert_eq!(diff < 0.000001, diff > -0.000001);
+        let test_logloss = *test_metrics.get("logloss").unwrap();
+        assert!(
+            (test_logloss - 0.0069199526).abs() < 1e-6,
+            "test logloss drifted: got {test_logloss}"
+        );
         assert_eq!(*test_metrics.get("map@4-").unwrap(), 1.0);
 
         let v = booster.predict(&dmat_test).unwrap();
@@ -1539,13 +1542,17 @@ mod tests {
         let eps = 1e-6;
 
         for (pred, expected) in v.iter().zip(&expected_start) {
-            println!("predictions={}, expected={}", pred, expected);
-            assert!(pred - expected < eps);
+            assert!(
+                (pred - expected).abs() < eps,
+                "prediction drifted: got {pred}, expected {expected}"
+            );
         }
 
         for (pred, expected) in v[v.len() - 10..].iter().zip(&expected_end) {
-            println!("predictions={}, expected={}", pred, expected);
-            assert!(pred - expected < eps);
+            assert!(
+                (pred - expected).abs() < eps,
+                "prediction drifted: got {pred}, expected {expected}"
+            );
         }
     }
 
@@ -1854,8 +1861,11 @@ mod tests {
         assert_eq!(*train_metrics.get("map@4-").unwrap(), 1.0);
 
         let test_metrics = booster.evaluate(&dmat_test).unwrap();
-        let diff = *test_metrics.get("logloss").unwrap() - 0.0069199526;
-        assert_eq!(diff < 0.000001, diff > -0.000001);
+        let test_logloss = *test_metrics.get("logloss").unwrap();
+        assert!(
+            (test_logloss - 0.0069199526).abs() < 1e-6,
+            "test logloss drifted: got {test_logloss}"
+        );
         assert_eq!(*test_metrics.get("map@4-").unwrap(), 1.0);
 
         let single_matrix = dmat_test.slice(&[0]).unwrap();
@@ -1900,13 +1910,17 @@ mod tests {
         let eps = 1e-6;
 
         for (pred, expected) in v.iter().zip(&expected_start) {
-            println!("predictions={}, expected={}", pred, expected);
-            assert!(pred - expected < eps);
+            assert!(
+                (pred - expected).abs() < eps,
+                "prediction drifted: got {pred}, expected {expected}"
+            );
         }
 
         for (pred, expected) in v[v.len() - 10..].iter().zip(&expected_end) {
-            println!("predictions={}, expected={}", pred, expected);
-            assert!(pred - expected < eps);
+            assert!(
+                (pred - expected).abs() < eps,
+                "prediction drifted: got {pred}, expected {expected}"
+            );
         }
     }
 

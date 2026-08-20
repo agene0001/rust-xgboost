@@ -1,3 +1,15 @@
+# Membership plus `default-members` is what runs xgboost-sys's own tests: cargo
+# does not build a path dependency's test targets, and in a workspace whose root
+# is itself a package a bare `cargo test` runs only the root package.
+#
+# examples/ holds standalone crates on older editions with pinned dependencies,
+# run in place by examples/runall.sh. Excluding them keeps `cargo run` working
+# inside each one and their dependency trees out of this workspace.
+[workspace]
+members = ["xgboost-sys"]
+default-members = [".", "xgboost-sys"]
+exclude = ["examples"]
+
 [package]
 name = "xgb"
 version = "3.3.0"

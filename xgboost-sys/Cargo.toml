@@ -14,6 +14,13 @@ exclude = [
 ]
 
 
+# bindgen copies c_api.h's doxygen comments into the generated bindings, and the
+# C snippets in them are not valid Rust, so rustdoc's extracted doctests cannot
+# compile (e.g. the XGBoosterPredictFromDMatrix example). There is no hand-written
+# documentation in this crate to test.
+[lib]
+doctest = false
+
 [build-dependencies]
 bindgen = { version = "0.72.1" }
 dunce =  { version = "1.0.5" }

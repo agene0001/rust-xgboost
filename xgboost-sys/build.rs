@@ -184,6 +184,7 @@ fn main() {
     let wrapper_h = xgb_root.join("include").join("xgboost").join("c_api.h");
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
+        .opaque_type("_IO_FILE")
         .clang_arg(format!("-I{}", xgb_root.join("include").display()))
         .clang_arg(format!("-I{}", xgb_root.join("dmlc-core").join("include").display()));
 
