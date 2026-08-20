@@ -147,6 +147,10 @@ fn main() {
     let wrapper_h = xgb_root.join("include").join("xgboost").join("c_api.h");
     let bindings = bindgen::Builder::default()
         .header(wrapper_h.to_string_lossy())
+        // c_api.h's doxygen prose is not valid Rust, and rustdoc extracts the C
+        // snippets in it as doctests. `cargo test --doc` runs those even with
+        // `[lib] doctest = false`, so keep them out of the bindings entirely.
+        .generate_comments(false)
         .opaque_type("_IO_FILE")
         .clang_arg(format!("-I{}", xgb_root.join("include").display()))
         .clang_arg(format!("-I{}", xgb_root.join("dmlc-core").join("include").display()));
@@ -243,8 +247,12 @@ fn main() {
         // built artifact are the exception and opt out with XGB_BUILD_NATIVE=0.
         // The distributed release assets are unaffected — release-libs.yml
         // invokes cmake directly and never runs this script.
+        //
+        // Not for MSVC: cl.exe answers `-march=native` with `D9002` on every
+        // translation unit, so it never applied there. windows-gnu is GCC and
+        // keeps it.
         println!("cargo:rerun-if-env-changed=XGB_BUILD_NATIVE");
-        if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") {
+        if env::var("XGB_BUILD_NATIVE").map_or(true, |v| v != "0") && !target.contains("msvc") {
             let flag = if target.contains("aarch64") { "-mcpu=native" } else { "-march=native" };
             dst.cflag(flag).cxxflag(flag);
         }
@@ -307,6 +315,12 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", dst.display());
         println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
         println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
+        // Not needed to link (bin/ holds the Windows runtime library, no import
+        // library), but cargo derives the PATH it gives test processes from these
+        // search dirs, and a doctest binary runs from a temp directory where the
+        // staged copy is not visible. Without it Windows doctests die with
+        // STATUS_DLL_NOT_FOUND.
+        println!("cargo:rustc-link-search=native={}", dst.join("bin").display());
         println!("cargo:rustc-link-lib=static=dmlc");
 
         let lib_file = if target.contains("windows") {
